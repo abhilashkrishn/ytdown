@@ -5,7 +5,7 @@ ENV PYTHONDONTWRITEBYTECODE=1 \
     PATH="/root/.deno/bin:${PATH}"
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    ca-certificates curl unzip \
+    ca-certificates curl unzip ffmpeg \
     && rm -rf /var/lib/apt/lists/*
 
 RUN curl -fsSL https://deno.land/install.sh | sh
