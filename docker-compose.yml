@@ -1,0 +1,14 @@
+services:
+  streamvault:
+    build: .
+    container_name: streamvault
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8300:8300"
+    env_file:
+      - .env
+    volumes:
+      - ./temp_downloads:/app/temp_downloads
+    init: true
+    security_opt:
+      - no-new-privileges:true
