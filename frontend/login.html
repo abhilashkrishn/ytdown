@@ -1,0 +1,70 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StreamVault — Login</title>
+    <link rel="stylesheet" href="static/style.css">
+    <style>
+        .login-error { color: var(--error); font-size: 14px; text-align: center; margin-top: 16px; display: none; }
+    </style>
+</head>
+<body>
+
+<main class="container">
+    <h1>StreamVault Auth</h1>
+    <div class="subtitle">Secure Pipeline Access</div>
+
+    <form id="loginForm" onsubmit="handleLogin(event)">
+        <div class="input-group">
+            <label for="username">Username</label>
+            <input type="text" id="username" name="username" required>
+        </div>
+        
+        <div class="input-group">
+            <label for="password">Password</label>
+            <input type="password" id="password" name="password" style="width: 100%; padding: 14px 16px; font-size: 14px; background-color: var(--surface); color: var(--text-main); border: 1px solid var(--border); border-radius: 10px; box-sizing: border-box; transition: var(--transition);" required>
+        </div>
+        
+        <button type="submit" id="loginBtn">Access Vault</button>
+        <div id="loginError" class="login-error">Invalid credentials</div>
+    </form>
+</main>
+
+<script>
+async function handleLogin(e) {
+    e.preventDefault();
+    const form = document.getElementById('loginForm');
+    const btn = document.getElementById('loginBtn');
+    const errorDiv = document.getElementById('loginError');
+    
+    btn.disabled = true;
+    errorDiv.style.display = 'none';
+
+    try {
+        const response = await fetch('api/login', {
+            method: 'POST',
+            headers: {
+    'Content-Type': 'application/x-www-form-urlencoded'
+},
+body: new URLSearchParams(new FormData(form)).toString()
+        });
+
+		const data = await response.json().catch(() => ({}));
+
+		if (response.ok) {
+			window.location.reload();
+		} else {
+			errorDiv.innerText = data.detail || `Login failed (${response.status})`;
+			errorDiv.style.display = 'block';
+			btn.disabled = false;
+		}
+    } catch (err) {
+        errorDiv.innerText = "Network Error";
+        errorDiv.style.display = 'block';
+        btn.disabled = false;
+    }
+}
+</script>
+</body>
+</html>

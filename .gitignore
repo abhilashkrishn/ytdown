@@ -1,0 +1,30 @@
+# Environment and secrets
+.env
+.env.*
+!.env.example
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+env/
+
+# Runtime files
+*.log
+*.pid
+*.part
+*.ytdl
+*.temp
+
+# Downloads and temporary data
+downloads/
+temp/
+tmp/
+
+# IDE and OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+cookies.txt

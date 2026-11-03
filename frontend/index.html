@@ -1,0 +1,54 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>StreamVault — Premium Video Downloader</title>
+    <link rel="stylesheet" href="static/style.css">
+</head>
+<body>
+
+<main class="container">
+    <div style="display: flex; justify-content: space-between; align-items: baseline;">
+        <h1>StreamVault</h1>
+        <a href="#" onclick="logout(event)" style="color: var(--text-muted); font-size: 13px; text-decoration: none;">Logout</a>
+    </div>
+    <div class="subtitle">Premium Universal Video Pipeline</div>
+
+    <div class="input-group">
+        <label for="videoUrl">Paste Video Link</label>
+        <input type="text" id="videoUrl" placeholder="https://youtube.com..." aria-required="true">
+    </div>
+    <button id="analyzeBtn" onclick="analyzeVideo()">Analyze Link</button>
+
+    <div id="formatSelection" class="panel">
+        <div id="displayTitle" class="video-title"></div>
+        <div class="input-group">
+            <label for="resolutionSelect">Select Dynamic Target Profile</label>
+            <select id="resolutionSelect"></select>
+        </div>
+        
+        <div class="button-group">
+            <button id="downloadBtn" onclick="startDownload()">Download to Browser</button>
+            <button id="cancelBtn" onclick="cancelDownload()" class="btn-danger" style="display: none;">Cancel</button>
+        </div>
+        
+        <div id="progressContainer" class="progress-container" style="display: none;">
+            <div class="progress-bar-wrapper">
+                <div id="progressBar" class="progress-bar-fill" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>
+            </div>
+            <div class="metrics-grid">
+                <div class="metric-item">Size: <span id="metricSize">0.00 MiB</span></div>
+                <div class="metric-item">Speed: <span id="metricSpeed">0.00 MiB/s</span></div>
+                <div class="metric-item">ETA: <span id="metricEta">--:--</span></div>
+                <div class="metric-item">Progress: <span id="metricPercent">0%</span></div>
+            </div>
+        </div>
+    </div>
+
+    <div id="statusText" style="display: none;"></div>
+</main>
+
+<script src="static/app.js"></script>
+</body>
+</html>
