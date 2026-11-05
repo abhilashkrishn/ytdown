@@ -12,10 +12,11 @@ import ipaddress
 import mimetypes
 import threading
 import unicodedata
+import shutil
 from contextlib import asynccontextmanager
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, quote
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends
-from fastapi.responses import FileResponse, StreamingResponse, JSONResponse
+from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 
@@ -113,6 +114,7 @@ SESSION_SECRET = os.getenv("SESSION_SECRET")
 CANONICAL_ORIGIN_RAW = os.getenv("CANONICAL_ORIGIN")
 TRUST_REVERSE_PROXY = os.getenv("TRUST_REVERSE_PROXY", "false").lower() == "true"
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "true").lower() == "true"
+USE_X_ACCEL_REDIRECT = os.getenv("USE_X_ACCEL_REDIRECT", "false").lower() == "true"
 
 TRUSTED_PROXIES_RAW = [p.strip() for p in os.getenv("TRUSTED_PROXIES", "127.0.0.1,::1").split(",")]
 TRUSTED_PROXIES = []
@@ -168,10 +170,13 @@ active_sessions = {}
 active_file_map = {}
 active_downloads = {}
 format_cache = {}
+pending_disconnect_cleanups = {}
 
 MAX_CONCURRENT_DOWNLOADS = 3
 MAX_CONCURRENT_EXTRACTIONS = 5
 UNCLAIMED_FILE_EXPIRY = 3600
+DISCONNECT_CLEANUP_GRACE_SECONDS = 60
+TMPFS_THRESHOLD_BYTES = 200 * 1024 * 1024  # 200 MB
 
 # Concurrency synchronization primitives (single-process asyncio event loop)
 state_lock = asyncio.Lock()
@@ -380,16 +385,56 @@ def sanitize_filename(name: str) -> str:
 def clean_terminal_ansi(text: str) -> str:
     return re.sub(r'\x1b\[[0-9;]*m', '', str(text))
 
+current_dir = os.path.dirname(os.path.abspath(__file__))
+frontend_dir = os.path.join(current_dir, "frontend")
+TEMP_DOWNLOAD_DIR = os.path.join(current_dir, "temp_downloads")
+TMPFS_DOWNLOAD_DIR = os.path.join(current_dir, "temp_downloads_tmpfs")
+os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(TMPFS_DOWNLOAD_DIR, exist_ok=True)
+
+class ResilientFileResponse(FileResponse):
+    def __init__(self, *args, on_completed=None, on_disconnected=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.on_completed = on_completed
+        self.on_disconnected = on_disconnected
+        self.chunk_size = 1024 * 1024  # 1 MiB chunk size for high throughput
+
+    async def __call__(self, scope, receive, send) -> None:
+        completed = False
+
+        async def tracking_send(message):
+            nonlocal completed
+            # Forward the message to the client first; only mark completed if send succeeds
+            await send(message)
+            if message.get("type") == "http.response.body" and not message.get("more_body", True):
+                completed = True
+
+        try:
+            await super().__call__(scope, receive, tracking_send)
+        except Exception:
+            if not completed and self.on_disconnected:
+                await self.on_disconnected()
+            raise
+        else:
+            if completed:
+                if self.on_completed:
+                    await self.on_completed()
+            else:
+                if self.on_disconnected:
+                    await self.on_disconnected()
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup: Clean up any abandoned temporary files from previous runs
-    for filename in os.listdir(TEMP_DOWNLOAD_DIR):
-        file_path = os.path.join(TEMP_DOWNLOAD_DIR, filename)
-        try:
-            if os.path.isfile(file_path):
-                os.remove(file_path)
-        except Exception as e:
-            print(f"Startup cleanup error: Could not remove {file_path} - {e}")
+    for target_dir in (TEMP_DOWNLOAD_DIR, TMPFS_DOWNLOAD_DIR):
+        if os.path.exists(target_dir):
+            for filename in os.listdir(target_dir):
+                file_path = os.path.join(target_dir, filename)
+                try:
+                    if os.path.isfile(file_path):
+                        os.remove(file_path)
+                except Exception as e:
+                    print(f"Startup cleanup error: Could not remove {file_path} - {e}")
 
     maintenance_task = asyncio.create_task(periodic_maintenance_loop())
     try:
@@ -400,6 +445,12 @@ async def lifespan(app: FastAPI):
             await maintenance_task
         except asyncio.CancelledError:
             pass
+
+        # Cancel any pending disconnect cleanup timers and delete remaining files immediately
+        async with state_lock:
+            for task in list(pending_disconnect_cleanups.values()):
+                task.cancel()
+            pending_disconnect_cleanups.clear()
 
         # Graceful shutdown: signal cancellation to any running downloads and wait with timeout
         async with state_lock:
@@ -420,9 +471,6 @@ app = FastAPI(title="StreamVault Premium Platform Downloader", lifespan=lifespan
 current_dir = os.path.dirname(os.path.abspath(__file__))
 frontend_dir = os.path.join(current_dir, "frontend")
 app.mount("/static", StaticFiles(directory=frontend_dir), name="static")
-
-TEMP_DOWNLOAD_DIR = os.path.join(current_dir, "temp_downloads")
-os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
 
 
 ### --- SECTION 7: UI & AUTH ROUTES --- ###
@@ -710,10 +758,30 @@ async def download_progress(request: Request, url: str, format_id: str):
                             break
 
                     if downloaded_file and os.path.exists(downloaded_file):
+                        actual_size = os.path.getsize(downloaded_file)
+                        target_path = downloaded_file
+                        storage_type = "disk"
+
+                        # Hybrid storage tiering: move files < 200 MB to dedicated 200 MB tmpfs
+                        if actual_size < TMPFS_THRESHOLD_BYTES:
+                            tmpfs_dest = os.path.join(TMPFS_DOWNLOAD_DIR, os.path.basename(downloaded_file))
+                            try:
+                                shutil.move(downloaded_file, tmpfs_dest)
+                                target_path = tmpfs_dest
+                                storage_type = "tmpfs"
+                            except Exception as move_err:
+                                print(f"Warning: Failed to move {downloaded_file} to tmpfs: {move_err}. Retaining on disk.")
+                                # Ensure any partial or corrupted destination file on tmpfs is cleaned up
+                                cleanup_file(tmpfs_dest)
+                                target_path = downloaded_file
+                                storage_type = "disk"
+
                         async with state_lock:
                             active_file_map[file_uuid] = {
-                                "filepath": downloaded_file,
-                                "expires": time.time() + UNCLAIMED_FILE_EXPIRY
+                                "filepath": target_path,
+                                "expires": time.time() + UNCLAIMED_FILE_EXPIRY,
+                                "storage_type": storage_type,
+                                "size": actual_size
                             }
                         yield f"data: {json.dumps({'status': 'completed', 'file_id': file_uuid})}\n\n"
                     else:
@@ -801,24 +869,35 @@ async def cancel_download(file_id: str):
     raise HTTPException(status_code=404, detail="Download not running")
 
 @app.get("/api/get-file", dependencies=[Depends(verify_session)])
-async def get_file(file_id: str, title: str, background_tasks: BackgroundTasks):
+async def get_file(request: Request, file_id: str, title: str):
     validate_uuid(file_id)
 
-    # Atomically consume the file entry to ensure strictly one-time retrieval
     async with state_lock:
-        file_record = active_file_map.pop(file_id, None)
-    if not file_record:
-        raise HTTPException(status_code=404, detail="Asset expired, invalid, or already downloaded.")
+        file_record = active_file_map.get(file_id)
+        if not file_record:
+            raise HTTPException(status_code=404, detail="Asset expired, invalid, or already downloaded.")
 
-    filepath = file_record["filepath"]
+        # Atomically cancel any pending 60s disconnect cleanup timer and register active stream
+        pending_timer = pending_disconnect_cleanups.pop(file_id, None)
+        if pending_timer:
+            pending_timer.cancel()
 
-    # Explicitly check for expiry
-    if time.time() >= file_record["expires"]:
-        cleanup_file(filepath)
-        raise HTTPException(status_code=404, detail="Asset has expired.")
+        file_record["active_streams"] = file_record.get("active_streams", 0) + 1
+        filepath = file_record["filepath"]
+        file_size = file_record.get("size", 0)
+        storage_type = file_record.get("storage_type", "disk")
 
-    if not os.path.exists(filepath):
-        raise HTTPException(status_code=404, detail="Asset no longer exists on disk.")
+        # Explicitly check for expiry
+        if time.time() >= file_record["expires"]:
+            file_record["active_streams"] = max(0, file_record["active_streams"] - 1)
+            active_file_map.pop(file_id, None)
+            cleanup_file(filepath)
+            raise HTTPException(status_code=404, detail="Asset has expired.")
+
+        if not os.path.exists(filepath):
+            file_record["active_streams"] = max(0, file_record["active_streams"] - 1)
+            active_file_map.pop(file_id, None)
+            raise HTTPException(status_code=404, detail="Asset no longer exists on disk.")
 
     safe_name = sanitize_filename(title)
     if not safe_name:
@@ -829,17 +908,129 @@ async def get_file(file_id: str, title: str, background_tasks: BackgroundTasks):
         ext = ".mp4"
     guessed_type, _ = mimetypes.guess_type(filepath)
     media_type = guessed_type or "application/octet-stream"
+    encoded_filename = quote(f"{safe_name}{ext}")
 
-    response = FileResponse(
+    async def on_stream_end(was_full_success: bool):
+        async with state_lock:
+            rec = active_file_map.get(file_id)
+            if not rec:
+                return
+            rec["active_streams"] = max(0, rec.get("active_streams", 1) - 1)
+            remaining_streams = rec["active_streams"]
+
+            if was_full_success and remaining_streams == 0:
+                active_file_map.pop(file_id, None)
+                timer = pending_disconnect_cleanups.pop(file_id, None)
+                if timer:
+                    timer.cancel()
+                cleanup_file(filepath)
+                return
+
+            if remaining_streams == 0:
+                # Disconnected or Range segment finished; schedule 60s inactivity cleanup
+                async def delayed_disconnect_cleanup():
+                    try:
+                        await asyncio.sleep(DISCONNECT_CLEANUP_GRACE_SECONDS)
+                        async with state_lock:
+                            if file_id in active_file_map and active_file_map[file_id].get("active_streams", 0) == 0:
+                                active_file_map.pop(file_id, None)
+                                pending_disconnect_cleanups.pop(file_id, None)
+                                cleanup_file(filepath)
+                    except asyncio.CancelledError:
+                        pass
+
+                existing_timer = pending_disconnect_cleanups.pop(file_id, None)
+                if existing_timer:
+                    existing_timer.cancel()
+                pending_disconnect_cleanups[file_id] = asyncio.create_task(delayed_disconnect_cleanup())
+
+    # Mode 1: Nginx X-Accel-Redirect delivery
+    if USE_X_ACCEL_REDIRECT:
+        filename_only = os.path.basename(filepath)
+        internal_uri = f"/internal_tmpfs/{filename_only}" if storage_type == "tmpfs" else f"/internal_downloads/{filename_only}"
+        callback_sig = hmac.new(SESSION_SECRET.encode(), file_id.encode(), digestmod="sha256").hexdigest()
+
+        headers = {
+            "X-Accel-Redirect": internal_uri,
+            "Content-Type": media_type,
+            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
+            "Accept-Ranges": "bytes",
+            "X-StreamVault-File-Id": file_id,
+            "X-StreamVault-Signature": callback_sig
+        }
+        return Response(status_code=200, headers=headers)
+
+    # Mode 2: Hybrid Python ResilientFileResponse delivery with Range & 60s disconnect handling
+    is_range_request = "range" in request.headers
+    return ResilientFileResponse(
         path=filepath,
         media_type=media_type,
-        filename=f"{safe_name}{ext}"
+        filename=f"{safe_name}{ext}",
+        on_completed=lambda: on_stream_end(was_full_success=(not is_range_request)),
+        on_disconnected=lambda: on_stream_end(was_full_success=False)
     )
 
-    # Ensure the file is deleted from disk after it has been successfully streamed
-    background_tasks.add_task(cleanup_file, filepath)
+@app.post("/api/internal/transfer-status")
+async def nginx_transfer_status(request: Request):
+    """
+    Internal endpoint called by Nginx post_action.
+    Restricted to loopback / trusted proxy IPs with HMAC signature verification.
+    """
+    client_ip = get_client_ip(request)
+    if client_ip not in TRUSTED_PROXIES and client_ip not in ("127.0.0.1", "::1"):
+        raise HTTPException(status_code=403, detail="Forbidden: internal access only")
 
-    return response
+    file_id = request.query_params.get("file_id", "")
+    sig = request.query_params.get("sig", "")
+    status_code = request.query_params.get("status", "")
+    bytes_sent = int(request.query_params.get("bytes", "0") or "0")
+
+    validate_uuid(file_id)
+
+    # Validate HMAC signature
+    expected_sig = hmac.new(SESSION_SECRET.encode(), file_id.encode(), digestmod="sha256").hexdigest()
+    if not hmac.compare_digest(sig, expected_sig):
+        raise HTTPException(status_code=403, detail="Invalid callback signature")
+
+    async with state_lock:
+        file_record = active_file_map.get(file_id)
+        if not file_record:
+            return {"status": "ignored"}
+
+        file_record["active_streams"] = max(0, file_record.get("active_streams", 1) - 1)
+        filepath = file_record["filepath"]
+        file_size = file_record.get("size", 0)
+
+        # Check if complete delivery or client disconnected
+        is_complete = (status_code in ("200", "206") and bytes_sent >= file_size)
+
+        if is_complete and file_record["active_streams"] == 0:
+            active_file_map.pop(file_id, None)
+            timer = pending_disconnect_cleanups.pop(file_id, None)
+            if timer:
+                timer.cancel()
+            cleanup_file(filepath)
+            return {"status": "cleaned"}
+
+        # Disconnected or partial range transfer with no other active streams: wait 60 seconds
+        if file_record["active_streams"] == 0:
+            async def delayed_disconnect_cleanup():
+                try:
+                    await asyncio.sleep(DISCONNECT_CLEANUP_GRACE_SECONDS)
+                    async with state_lock:
+                        if file_record.get("active_streams", 0) == 0:
+                            active_file_map.pop(file_id, None)
+                            pending_disconnect_cleanups.pop(file_id, None)
+                            cleanup_file(filepath)
+                except asyncio.CancelledError:
+                    pass
+
+            existing_timer = pending_disconnect_cleanups.pop(file_id, None)
+            if existing_timer:
+                existing_timer.cancel()
+            pending_disconnect_cleanups[file_id] = asyncio.create_task(delayed_disconnect_cleanup())
+
+    return {"status": "ok"}
 
 if __name__ == "__main__":
     import uvicorn

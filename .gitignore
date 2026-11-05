@@ -21,6 +21,8 @@ env/
 downloads/
 temp/
 tmp/
+temp_downloads/
+temp_downloads_tmpfs/
 
 # IDE and OS
 .vscode/

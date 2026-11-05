@@ -9,6 +9,7 @@ services:
       - .env
     volumes:
       - ./temp_downloads:/app/temp_downloads
+      - ./temp_downloads_tmpfs:/app/temp_downloads_tmpfs
       - ./.env:/app/.env:ro
       - ./cookies.txt:/app/cookies.txt
     init: true
