@@ -401,6 +401,7 @@ class ResilientFileResponse(FileResponse):
 
     async def __call__(self, scope, receive, send) -> None:
         completed = False
+        callback_executed = False
 
         async def tracking_send(message):
             nonlocal completed
@@ -411,17 +412,15 @@ class ResilientFileResponse(FileResponse):
 
         try:
             await super().__call__(scope, receive, tracking_send)
-        except Exception:
-            if not completed and self.on_disconnected:
-                await self.on_disconnected()
-            raise
-        else:
-            if completed:
-                if self.on_completed:
-                    await self.on_completed()
-            else:
-                if self.on_disconnected:
-                    await self.on_disconnected()
+        finally:
+            if not callback_executed:
+                callback_executed = True
+                cb = self.on_completed if completed else self.on_disconnected
+                if cb:
+                    res = cb()
+                    if asyncio.iscoroutine(res):
+                        # Shield callback execution against cancellation to guarantee active_streams decrement
+                        await asyncio.shield(res)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -877,7 +876,7 @@ async def get_file(request: Request, file_id: str, title: str):
         if not file_record:
             raise HTTPException(status_code=404, detail="Asset expired, invalid, or already downloaded.")
 
-        # Atomically cancel any pending 60s disconnect cleanup timer and register active stream
+        # Cancel any pending 60s disconnect cleanup timer before registering a new stream
         pending_timer = pending_disconnect_cleanups.pop(file_id, None)
         if pending_timer:
             pending_timer.cancel()
@@ -886,8 +885,9 @@ async def get_file(request: Request, file_id: str, title: str):
         filepath = file_record["filepath"]
         file_size = file_record.get("size", 0)
         storage_type = file_record.get("storage_type", "disk")
+        record_id = id(file_record)
 
-        # Explicitly check for expiry
+        # Check for asset expiration or disk absence
         if time.time() >= file_record["expires"]:
             file_record["active_streams"] = max(0, file_record["active_streams"] - 1)
             active_file_map.pop(file_id, None)
@@ -910,14 +910,35 @@ async def get_file(request: Request, file_id: str, title: str):
     media_type = guessed_type or "application/octet-stream"
     encoded_filename = quote(f"{safe_name}{ext}")
 
+    def schedule_inactivity_cleanup(rec):
+        """Helper to schedule a safe 60s delayed cleanup verifying record identity."""
+        async def delayed_disconnect_cleanup():
+            try:
+                await asyncio.sleep(DISCONNECT_CLEANUP_GRACE_SECONDS)
+                async with state_lock:
+                    current_rec = active_file_map.get(file_id)
+                    # Verify record identity and that zero streams are active
+                    if current_rec is rec and current_rec.get("active_streams", 0) == 0:
+                        active_file_map.pop(file_id, None)
+                        pending_disconnect_cleanups.pop(file_id, None)
+                        cleanup_file(filepath)
+            except asyncio.CancelledError:
+                pass
+
+        existing_timer = pending_disconnect_cleanups.pop(file_id, None)
+        if existing_timer:
+            existing_timer.cancel()
+        pending_disconnect_cleanups[file_id] = asyncio.create_task(delayed_disconnect_cleanup())
+
     async def on_stream_end(was_full_success: bool):
         async with state_lock:
             rec = active_file_map.get(file_id)
-            if not rec:
+            if not rec or id(rec) != record_id:
                 return
             rec["active_streams"] = max(0, rec.get("active_streams", 1) - 1)
             remaining_streams = rec["active_streams"]
 
+            # Immediate cleanup only for full non-range downloads when no other streams are active
             if was_full_success and remaining_streams == 0:
                 active_file_map.pop(file_id, None)
                 timer = pending_disconnect_cleanups.pop(file_id, None)
@@ -926,23 +947,9 @@ async def get_file(request: Request, file_id: str, title: str):
                 cleanup_file(filepath)
                 return
 
+            # For Range requests, disconnects, or partial streams with 0 active streams, start 60s grace timer
             if remaining_streams == 0:
-                # Disconnected or Range segment finished; schedule 60s inactivity cleanup
-                async def delayed_disconnect_cleanup():
-                    try:
-                        await asyncio.sleep(DISCONNECT_CLEANUP_GRACE_SECONDS)
-                        async with state_lock:
-                            if file_id in active_file_map and active_file_map[file_id].get("active_streams", 0) == 0:
-                                active_file_map.pop(file_id, None)
-                                pending_disconnect_cleanups.pop(file_id, None)
-                                cleanup_file(filepath)
-                    except asyncio.CancelledError:
-                        pass
-
-                existing_timer = pending_disconnect_cleanups.pop(file_id, None)
-                if existing_timer:
-                    existing_timer.cancel()
-                pending_disconnect_cleanups[file_id] = asyncio.create_task(delayed_disconnect_cleanup())
+                schedule_inactivity_cleanup(rec)
 
     # Mode 1: Nginx X-Accel-Redirect delivery
     if USE_X_ACCEL_REDIRECT:
@@ -998,13 +1005,14 @@ async def nginx_transfer_status(request: Request):
             return {"status": "ignored"}
 
         file_record["active_streams"] = max(0, file_record.get("active_streams", 1) - 1)
+        remaining_streams = file_record["active_streams"]
         filepath = file_record["filepath"]
         file_size = file_record.get("size", 0)
 
-        # Check if complete delivery or client disconnected
-        is_complete = (status_code in ("200", "206") and bytes_sent >= file_size)
+        # Full delivery criteria: HTTP 200 (complete non-Range transfer) transferring the full file size
+        is_full_complete = (status_code == "200" and bytes_sent >= file_size)
 
-        if is_complete and file_record["active_streams"] == 0:
+        if is_full_complete and remaining_streams == 0:
             active_file_map.pop(file_id, None)
             timer = pending_disconnect_cleanups.pop(file_id, None)
             if timer:
@@ -1012,13 +1020,16 @@ async def nginx_transfer_status(request: Request):
             cleanup_file(filepath)
             return {"status": "cleaned"}
 
-        # Disconnected or partial range transfer with no other active streams: wait 60 seconds
-        if file_record["active_streams"] == 0:
+        # For partial Range responses (status 206), client disconnects (status 499), or partial bytes:
+        # Schedule the 60-second inactivity timer when active streams drop to 0
+        if remaining_streams == 0:
+            rec_ref = file_record
             async def delayed_disconnect_cleanup():
                 try:
                     await asyncio.sleep(DISCONNECT_CLEANUP_GRACE_SECONDS)
                     async with state_lock:
-                        if file_record.get("active_streams", 0) == 0:
+                        current_rec = active_file_map.get(file_id)
+                        if current_rec is rec_ref and current_rec.get("active_streams", 0) == 0:
                             active_file_map.pop(file_id, None)
                             pending_disconnect_cleanups.pop(file_id, None)
                             cleanup_file(filepath)
