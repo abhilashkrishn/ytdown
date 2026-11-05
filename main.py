@@ -497,24 +497,54 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
                 # Full response: verify bytes_sent against content_length and file_size
                 if content_length.isdigit() and bytes_sent == int(content_length) == file_size and file_size > 0:
                     delivered_interval = (0, file_size)
-            elif status == 206 and content_range and file_size > 0:
-                # Partial response: parse Content-Range header (e.g. "bytes 100-499/1000")
-                match = re.match(r"^bytes\s+(\d+)-(\d+)/(?:\*|(\d+))$", str(content_range).strip())
-                if match:
-                    range_start = int(match.group(1))
-                    range_end = int(match.group(2))
-                    instance_length = int(match.group(3)) if match.group(3) else file_size
+            elif status == 206 or (content_range and str(content_range).strip() not in ("", "-")):
+                # Partial response / Range event: parse and validate Content-Range header
+                rejection_reason = None
+                clean_range = str(content_range).strip() if content_range else None
 
-                    expected_length = (range_end - range_start + 1)
-                    # Delivered range is valid only if bytes_sent equals expected chunk length and bounds match file
-                    if (
-                        instance_length == file_size and
-                        range_start <= range_end < file_size and
-                        content_length.isdigit() and
-                        bytes_sent == int(content_length) == expected_length and
-                        expected_length > 0
-                    ):
-                        delivered_interval = (range_start, range_end + 1)
+                if status != 206:
+                    rejection_reason = f"unexpected HTTP status {status} (expected 206)"
+                elif not clean_range or clean_range == "-":
+                    rejection_reason = "missing or empty Content-Range header"
+                elif file_size <= 0:
+                    rejection_reason = f"invalid recorded file_size ({file_size})"
+                else:
+                    match = re.match(r"^bytes\s+(\d+)-(\d+)/(?:\*|(\d+))$", clean_range)
+                    if not match:
+                        rejection_reason = f"malformed Content-Range syntax '{clean_range}'"
+                    else:
+                        range_start = int(match.group(1))
+                        range_end = int(match.group(2))
+                        instance_length = int(match.group(3)) if match.group(3) else file_size
+                        expected_length = range_end - range_start + 1
+
+                        if range_start > range_end or expected_length <= 0:
+                            rejection_reason = f"invalid range bounds: start ({range_start}) > end ({range_end})"
+                        elif range_start < 0 or range_end >= file_size:
+                            rejection_reason = f"range bounds [{range_start}, {range_end}] exceed file bounds [0, {file_size - 1}]"
+                        elif instance_length != file_size:
+                            rejection_reason = f"instance_length ({instance_length}) != file_size ({file_size})"
+                        elif not content_length.isdigit():
+                            rejection_reason = f"non-numeric content_length '{content_length}'"
+                        elif int(content_length) != expected_length:
+                            rejection_reason = f"content_length ({content_length}) != expected_length ({expected_length})"
+                        elif bytes_sent != expected_length:
+                            rejection_reason = f"bytes_sent ({bytes_sent}) != expected_length ({expected_length})"
+                        else:
+                            delivered_interval = (range_start, range_end + 1)
+
+                if delivered_interval:
+                    print(
+                        f"[NGINX_LOG] Range accepted: status={status}, bytes_sent={bytes_sent}, "
+                        f"content_length={content_length}, content_range={content_range} -> "
+                        f"interval={delivered_interval} for file_id={file_id}"
+                    )
+                else:
+                    print(
+                        f"[NGINX_LOG] Range rejected: status={status}, bytes_sent={bytes_sent}, "
+                        f"content_length={content_length}, content_range={content_range} -> "
+                        f"reason: {rejection_reason} for file_id={file_id}"
+                    )
 
             if delivered_interval:
                 rec["delivered_ranges"] = add_delivered_range(
