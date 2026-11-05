@@ -18,7 +18,7 @@ RUN pip install --no-cache-dir -r requirements.txt
 COPY main.py .
 COPY frontend/ ./frontend/
 
-RUN mkdir -p /app/temp_downloads /app/temp_downloads_tmpfs
+RUN mkdir -p /app/temp_downloads /app/temp_downloads_tmpfs /app/run
 
 EXPOSE 8300
 

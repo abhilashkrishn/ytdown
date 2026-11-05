@@ -115,6 +115,7 @@ CANONICAL_ORIGIN_RAW = os.getenv("CANONICAL_ORIGIN")
 TRUST_REVERSE_PROXY = os.getenv("TRUST_REVERSE_PROXY", "false").lower() == "true"
 COOKIE_SECURE = os.getenv("COOKIE_SECURE", "true").lower() == "true"
 USE_X_ACCEL_REDIRECT = os.getenv("USE_X_ACCEL_REDIRECT", "false").lower() == "true"
+NGINX_LOG_SOCKET_GROUP = os.getenv("NGINX_LOG_SOCKET_GROUP")
 
 TRUSTED_PROXIES_RAW = [p.strip() for p in os.getenv("TRUSTED_PROXIES", "127.0.0.1,::1").split(",")]
 TRUSTED_PROXIES = []
@@ -389,8 +390,62 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 frontend_dir = os.path.join(current_dir, "frontend")
 TEMP_DOWNLOAD_DIR = os.path.join(current_dir, "temp_downloads")
 TMPFS_DOWNLOAD_DIR = os.path.join(current_dir, "temp_downloads_tmpfs")
+RUN_DIR = os.path.join(current_dir, "run")
 os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(TMPFS_DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(RUN_DIR, exist_ok=True)
+
+class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
+    def datagram_received(self, data: bytes, addr):
+        try:
+            raw_text = data.decode("utf-8", errors="ignore")
+            json_start = raw_text.find("{")
+            json_end = raw_text.rfind("}")
+            if json_start == -1 or json_end == -1:
+                return
+            payload = json.loads(raw_text[json_start:json_end + 1])
+
+            file_id = payload.get("file_id")
+            request_id = payload.get("request_id")
+            status = payload.get("status")
+            bytes_sent = payload.get("bytes_sent", 0)
+            content_length = str(payload.get("content_length", "0"))
+
+            if not file_id or not request_id:
+                return
+
+            asyncio.create_task(self.handle_completion(file_id, request_id, status, bytes_sent, content_length))
+        except Exception as e:
+            print(f"Error parsing Nginx access-log datagram: {e}")
+
+    async def handle_completion(self, file_id: str, request_id: str, status: int, bytes_sent: int, content_length: str):
+        async with state_lock:
+            rec = active_file_map.get(file_id)
+            if not rec:
+                return
+
+            pending_set = rec.get("pending_requests", set())
+            if request_id not in pending_set:
+                return
+
+            pending_set.discard(request_id)
+            file_size = rec.get("size", 0)
+
+            # Completion criteria: HTTP 200, bytes_sent matches Content-Length and recorded file size
+            is_full_complete = (
+                status == 200 and
+                content_length.isdigit() and
+                bytes_sent == int(content_length) == file_size and
+                file_size > 0
+            )
+
+            # Idempotent cleanup: delete only if full response validated and no other registered requests remain
+            if is_full_complete and len(pending_set) == 0:
+                active_file_map.pop(file_id, None)
+                timer = pending_disconnect_cleanups.pop(file_id, None)
+                if timer:
+                    timer.cancel()
+                cleanup_file(rec["filepath"])
 
 class ResilientFileResponse(FileResponse):
     def __init__(self, *args, on_completed=None, on_disconnected=None, **kwargs):
@@ -436,9 +491,58 @@ async def lifespan(app: FastAPI):
                     print(f"Startup cleanup error: Could not remove {file_path} - {e}")
 
     maintenance_task = asyncio.create_task(periodic_maintenance_loop())
+
+    # Initialize AF_UNIX / SOCK_DGRAM listener for Nginx access-log events if running on POSIX
+    nginx_sock_transport = None
+    nginx_bound_socket = None
+    socket_path = os.path.join(RUN_DIR, "streamvault_logs.sock")
+
+    if hasattr(socket, "AF_UNIX"):
+        try:
+            if os.path.exists(socket_path):
+                os.remove(socket_path)
+
+            nginx_bound_socket = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
+            nginx_bound_socket.setblocking(False)
+            nginx_bound_socket.bind(socket_path)
+
+            # Restrictive permissions: 660 (owner & group read/write, no world access)
+            os.chmod(socket_path, 0o660)
+
+            # Configurable group ownership for host Nginx access
+            if NGINX_LOG_SOCKET_GROUP:
+                try:
+                    import grp
+                    group_info = grp.getgrnam(NGINX_LOG_SOCKET_GROUP)
+                    os.chown(socket_path, -1, group_info.gr_gid)
+                except (KeyError, ImportError, PermissionError, OSError) as grp_err:
+                    print(f"Warning: Could not set group ownership for {socket_path} to '{NGINX_LOG_SOCKET_GROUP}': {grp_err}")
+
+            loop = asyncio.get_running_loop()
+            nginx_sock_transport, _ = await loop.create_datagram_endpoint(
+                lambda: NginxLogDatagramProtocol(),
+                sock=nginx_bound_socket
+            )
+        except Exception as sock_init_err:
+            print(f"Warning: Failed to initialize Nginx access-log Unix datagram listener: {sock_init_err}")
+            if nginx_bound_socket:
+                nginx_bound_socket.close()
+
     try:
         yield
     finally:
+        # Shutdown Nginx access-log listener and remove socket file
+        if nginx_sock_transport:
+            nginx_sock_transport.close()
+        elif nginx_bound_socket:
+            nginx_bound_socket.close()
+
+        if os.path.exists(socket_path):
+            try:
+                os.remove(socket_path)
+            except OSError:
+                pass
+
         maintenance_task.cancel()
         try:
             await maintenance_task
@@ -954,16 +1058,22 @@ async def get_file(request: Request, file_id: str, title: str):
     # Mode 1: Nginx X-Accel-Redirect delivery
     if USE_X_ACCEL_REDIRECT:
         filename_only = os.path.basename(filepath)
-        internal_uri = f"/internal_tmpfs/{filename_only}" if storage_type == "tmpfs" else f"/internal_downloads/{filename_only}"
-        callback_sig = hmac.new(SESSION_SECRET.encode(), file_id.encode(), digestmod="sha256").hexdigest()
+        internal_base = f"/internal_tmpfs/{filename_only}" if storage_type == "tmpfs" else f"/internal_downloads/{filename_only}"
+
+        request_id = str(uuid.uuid4())
+        async with state_lock:
+            # Register unique request ID before returning X-Accel-Redirect
+            rec = active_file_map.get(file_id)
+            if rec:
+                rec.setdefault("pending_requests", set()).add(request_id)
+
+        internal_uri = f"{internal_base}?sv_fid={file_id}&sv_rid={request_id}"
 
         headers = {
             "X-Accel-Redirect": internal_uri,
             "Content-Type": media_type,
             "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
-            "Accept-Ranges": "bytes",
-            "X-StreamVault-File-Id": file_id,
-            "X-StreamVault-Signature": callback_sig
+            "Accept-Ranges": "bytes"
         }
         return Response(status_code=200, headers=headers)
 
@@ -976,72 +1086,6 @@ async def get_file(request: Request, file_id: str, title: str):
         on_completed=lambda: on_stream_end(was_full_success=(not is_range_request)),
         on_disconnected=lambda: on_stream_end(was_full_success=False)
     )
-
-@app.post("/api/internal/transfer-status")
-async def nginx_transfer_status(request: Request):
-    """
-    Internal endpoint called by Nginx post_action.
-    Restricted to loopback / trusted proxy IPs with HMAC signature verification.
-    """
-    client_ip = get_client_ip(request)
-    if client_ip not in TRUSTED_PROXIES and client_ip not in ("127.0.0.1", "::1"):
-        raise HTTPException(status_code=403, detail="Forbidden: internal access only")
-
-    file_id = request.query_params.get("file_id", "")
-    sig = request.query_params.get("sig", "")
-    status_code = request.query_params.get("status", "")
-    bytes_sent = int(request.query_params.get("bytes", "0") or "0")
-
-    validate_uuid(file_id)
-
-    # Validate HMAC signature
-    expected_sig = hmac.new(SESSION_SECRET.encode(), file_id.encode(), digestmod="sha256").hexdigest()
-    if not hmac.compare_digest(sig, expected_sig):
-        raise HTTPException(status_code=403, detail="Invalid callback signature")
-
-    async with state_lock:
-        file_record = active_file_map.get(file_id)
-        if not file_record:
-            return {"status": "ignored"}
-
-        file_record["active_streams"] = max(0, file_record.get("active_streams", 1) - 1)
-        remaining_streams = file_record["active_streams"]
-        filepath = file_record["filepath"]
-        file_size = file_record.get("size", 0)
-
-        # Full delivery criteria: HTTP 200 (complete non-Range transfer) transferring the full file size
-        is_full_complete = (status_code == "200" and bytes_sent >= file_size)
-
-        if is_full_complete and remaining_streams == 0:
-            active_file_map.pop(file_id, None)
-            timer = pending_disconnect_cleanups.pop(file_id, None)
-            if timer:
-                timer.cancel()
-            cleanup_file(filepath)
-            return {"status": "cleaned"}
-
-        # For partial Range responses (status 206), client disconnects (status 499), or partial bytes:
-        # Schedule the 60-second inactivity timer when active streams drop to 0
-        if remaining_streams == 0:
-            rec_ref = file_record
-            async def delayed_disconnect_cleanup():
-                try:
-                    await asyncio.sleep(DISCONNECT_CLEANUP_GRACE_SECONDS)
-                    async with state_lock:
-                        current_rec = active_file_map.get(file_id)
-                        if current_rec is rec_ref and current_rec.get("active_streams", 0) == 0:
-                            active_file_map.pop(file_id, None)
-                            pending_disconnect_cleanups.pop(file_id, None)
-                            cleanup_file(filepath)
-                except asyncio.CancelledError:
-                    pass
-
-            existing_timer = pending_disconnect_cleanups.pop(file_id, None)
-            if existing_timer:
-                existing_timer.cancel()
-            pending_disconnect_cleanups[file_id] = asyncio.create_task(delayed_disconnect_cleanup())
-
-    return {"status": "ok"}
 
 if __name__ == "__main__":
     import uvicorn

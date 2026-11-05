@@ -10,6 +10,7 @@ services:
     volumes:
       - ./temp_downloads:/app/temp_downloads
       - ./temp_downloads_tmpfs:/app/temp_downloads_tmpfs
+      - ./run:/app/run
       - ./.env:/app/.env:ro
       - ./cookies.txt:/app/cookies.txt
     init: true
