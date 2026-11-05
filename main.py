@@ -499,17 +499,19 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
             rejection_reason = None
 
             if status == 200:
-                # Full response: verify bytes_sent against content_length and file_size
+                # HTTP 200 response: require content_length == file_size and accept 0 < bytes_sent <= file_size
                 if file_size <= 0:
                     rejection_reason = f"invalid recorded file_size ({file_size})"
                 elif not content_length.isdigit():
                     rejection_reason = f"non-numeric content_length '{content_length}'"
                 elif int(content_length) != file_size:
                     rejection_reason = f"content_length ({content_length}) != file_size ({file_size})"
-                elif bytes_sent != file_size:
-                    rejection_reason = f"bytes_sent ({bytes_sent}) != file_size ({file_size})"
+                elif bytes_sent <= 0:
+                    rejection_reason = f"bytes_sent ({bytes_sent}) <= 0"
+                elif bytes_sent > file_size:
+                    rejection_reason = f"bytes_sent ({bytes_sent}) exceeds file_size ({file_size})"
                 else:
-                    delivered_interval = (0, file_size)
+                    delivered_interval = (0, bytes_sent)
 
             elif status == 206:
                 # Partial response / Range event: parse and validate Content-Range header
