@@ -436,6 +436,23 @@ def is_fully_covered(delivered_ranges: list, total_size: int) -> bool:
     return False
 
 class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
+    def __init__(self):
+        super().__init__()
+        self.active_tasks: set[asyncio.Task] = set()
+
+    def _task_done_callback(self, task: asyncio.Task):
+        self.active_tasks.discard(task)
+        if task.cancelled():
+            return
+        try:
+            exc = task.exception()
+            if exc:
+                print(f"[NGINX_LOG] Completion handler task raised an exception: {exc}")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            print(f"[NGINX_LOG] Error in completion handler done callback: {e}")
+
     def datagram_received(self, data: bytes, addr):
         try:
             raw_text = data.decode("utf-8", errors="ignore")
@@ -455,7 +472,7 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
             if not file_id or not request_id:
                 return
 
-            asyncio.create_task(
+            task = asyncio.create_task(
                 self.handle_completion(
                     file_id=file_id,
                     request_id=request_id,
@@ -465,6 +482,8 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
                     content_range=content_range
                 )
             )
+            self.active_tasks.add(task)
+            task.add_done_callback(self._task_done_callback)
         except Exception as e:
             print(f"[NGINX_LOG] Error parsing datagram: {e}")
 
