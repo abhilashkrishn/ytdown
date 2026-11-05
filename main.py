@@ -541,10 +541,12 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
                             rejection_reason = f"non-numeric content_length '{content_length}'"
                         elif int(content_length) != expected_length:
                             rejection_reason = f"content_length ({content_length}) != expected_length ({expected_length})"
-                        elif bytes_sent != expected_length:
-                            rejection_reason = f"bytes_sent ({bytes_sent}) != expected_length ({expected_length})"
+                        elif bytes_sent <= 0:
+                            rejection_reason = f"bytes_sent ({bytes_sent}) <= 0"
+                        elif bytes_sent > expected_length:
+                            rejection_reason = f"bytes_sent ({bytes_sent}) exceeds expected_length ({expected_length})"
                         else:
-                            delivered_interval = (range_start, range_end + 1)
+                            delivered_interval = (range_start, range_start + bytes_sent)
             else:
                 rejection_reason = f"unsupported or non-delivery HTTP status {status}"
 
