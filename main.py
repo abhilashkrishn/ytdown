@@ -13,6 +13,7 @@ import mimetypes
 import threading
 import unicodedata
 import shutil
+import typing
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse, parse_qs, quote
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends
@@ -177,6 +178,7 @@ MAX_CONCURRENT_DOWNLOADS = 3
 MAX_CONCURRENT_EXTRACTIONS = 5
 UNCLAIMED_FILE_EXPIRY = 3600
 DISCONNECT_CLEANUP_GRACE_SECONDS = 60
+X_ACCEL_QUIET_PERIOD_SECONDS = 5
 TMPFS_THRESHOLD_BYTES = 200 * 1024 * 1024  # 200 MB
 
 # Concurrency synchronization primitives (single-process asyncio event loop)
@@ -395,15 +397,51 @@ os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(TMPFS_DOWNLOAD_DIR, exist_ok=True)
 os.makedirs(RUN_DIR, exist_ok=True)
 
+def add_delivered_range(delivered_ranges: list, start: int, end: int) -> list:
+    """
+    Merges a newly delivered byte range [start, end) into an existing list of
+    disjoint sorted half-open intervals [[s0, e0), [s1, e1), ...].
+    """
+    if start >= end:
+        return delivered_ranges
+
+    new_ranges = []
+    inserted = False
+
+    for cur_s, cur_e in delivered_ranges:
+        if inserted:
+            new_ranges.append((cur_s, cur_e))
+        elif end < cur_s:
+            new_ranges.append((start, end))
+            new_ranges.append((cur_s, cur_e))
+            inserted = True
+        elif start > cur_e:
+            new_ranges.append((cur_s, cur_e))
+        else:
+            # Overlapping or contiguous intervals: merge
+            start = min(start, cur_s)
+            end = max(end, cur_e)
+
+    if not inserted:
+        new_ranges.append((start, end))
+
+    return new_ranges
+
+def is_fully_covered(delivered_ranges: list, total_size: int) -> bool:
+    """Checks if the delivered intervals completely cover [0, total_size)."""
+    if total_size <= 0:
+        return False
+    if len(delivered_ranges) == 1:
+        return delivered_ranges[0][0] == 0 and delivered_ranges[0][1] >= total_size
+    return False
+
 class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr):
         try:
             raw_text = data.decode("utf-8", errors="ignore")
-            print(f"[NGINX_LOG_DIAG] Received datagram from {addr}: {raw_text.strip()}")
             json_start = raw_text.find("{")
             json_end = raw_text.rfind("}")
             if json_start == -1 or json_end == -1:
-                print("[NGINX_LOG_DIAG] No JSON payload found in datagram")
                 return
             payload = json.loads(raw_text[json_start:json_end + 1])
 
@@ -412,52 +450,121 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
             status = payload.get("status")
             bytes_sent = payload.get("bytes_sent", 0)
             content_length = str(payload.get("content_length", "0"))
-
-            print(f"[NGINX_LOG_DIAG] Parsed fields: file_id={file_id}, request_id={request_id}, status={status}, bytes_sent={bytes_sent}, content_length={content_length}")
+            content_range = payload.get("content_range")
 
             if not file_id or not request_id:
-                print("[NGINX_LOG_DIAG] Missing file_id or request_id; ignoring datagram")
                 return
 
-            asyncio.create_task(self.handle_completion(file_id, request_id, status, bytes_sent, content_length))
+            asyncio.create_task(
+                self.handle_completion(
+                    file_id=file_id,
+                    request_id=request_id,
+                    status=status,
+                    bytes_sent=bytes_sent,
+                    content_length=content_length,
+                    content_range=content_range
+                )
+            )
         except Exception as e:
-            print(f"[NGINX_LOG_DIAG] Error parsing Nginx access-log datagram: {e}")
+            print(f"[NGINX_LOG] Error parsing datagram: {e}")
 
-    async def handle_completion(self, file_id: str, request_id: str, status: int, bytes_sent: int, content_length: str):
+    async def handle_completion(
+        self,
+        file_id: str,
+        request_id: str,
+        status: int,
+        bytes_sent: int,
+        content_length: str,
+        content_range: typing.Optional[str]
+    ):
         async with state_lock:
             rec = active_file_map.get(file_id)
             if not rec:
-                print(f"[NGINX_LOG_DIAG] Lookup failed: file_id={file_id} not found in active_file_map")
                 return
 
             pending_set = rec.get("pending_requests", set())
             if request_id not in pending_set:
-                print(f"[NGINX_LOG_DIAG] Lookup failed: request_id={request_id} not in pending_requests for file_id={file_id} (pending: {len(pending_set)})")
                 return
 
+            # Always remove the completed/evaluated request ID
             pending_set.discard(request_id)
             file_size = rec.get("size", 0)
+            delivered_ranges = rec.setdefault("delivered_ranges", [])
 
-            # Completion criteria: HTTP 200, bytes_sent matches Content-Length and recorded file size
-            is_full_complete = (
-                status == 200 and
-                content_length.isdigit() and
-                bytes_sent == int(content_length) == file_size and
-                file_size > 0
-            )
+            delivered_interval = None
+
+            if status == 200:
+                # Full response: verify bytes_sent against content_length and file_size
+                if content_length.isdigit() and bytes_sent == int(content_length) == file_size and file_size > 0:
+                    delivered_interval = (0, file_size)
+            elif status == 206 and content_range and file_size > 0:
+                # Partial response: parse Content-Range header (e.g. "bytes 100-499/1000")
+                match = re.match(r"^bytes\s+(\d+)-(\d+)/(?:\*|(\d+))$", str(content_range).strip())
+                if match:
+                    range_start = int(match.group(1))
+                    range_end = int(match.group(2))
+                    instance_length = int(match.group(3)) if match.group(3) else file_size
+
+                    expected_length = (range_end - range_start + 1)
+                    # Delivered range is valid only if bytes_sent equals expected chunk length and bounds match file
+                    if (
+                        instance_length == file_size and
+                        range_start <= range_end < file_size and
+                        content_length.isdigit() and
+                        bytes_sent == int(content_length) == expected_length and
+                        expected_length > 0
+                    ):
+                        delivered_interval = (range_start, range_end + 1)
+
+            if delivered_interval:
+                rec["delivered_ranges"] = add_delivered_range(
+                    delivered_ranges,
+                    delivered_interval[0],
+                    delivered_interval[1]
+                )
 
             remaining_requests = len(pending_set)
+            fully_covered = is_fully_covered(rec.get("delivered_ranges", []), file_size)
 
-            # Idempotent cleanup: delete only if full response validated and no other registered requests remain
-            if is_full_complete and remaining_requests == 0:
-                print(f"[NGINX_LOG_DIAG] Decision: DELETE file_id={file_id} (full completion verified, remaining_requests=0)")
-                active_file_map.pop(file_id, None)
-                timer = pending_disconnect_cleanups.pop(file_id, None)
-                if timer:
-                    timer.cancel()
-                cleanup_file(rec["filepath"])
+            if fully_covered and remaining_requests == 0:
+                print(f"[NGINX_LOG] Scheduling 5s quiet period before deletion for file_id={file_id}")
+                record_id = id(rec)
+                filepath = rec["filepath"]
+
+                async def delayed_quiet_period_cleanup():
+                    try:
+                        await asyncio.sleep(X_ACCEL_QUIET_PERIOD_SECONDS)
+                        async with state_lock:
+                            current_rec = active_file_map.get(file_id)
+                            # Re-verify record identity, zero pending requests, and complete byte coverage
+                            if (
+                                current_rec is not None and
+                                id(current_rec) == record_id and
+                                len(current_rec.get("pending_requests", set())) == 0 and
+                                is_fully_covered(current_rec.get("delivered_ranges", []), current_rec.get("size", 0))
+                            ):
+                                print(f"[NGINX_LOG] Decision: DELETE file_id={file_id} (quiet period elapsed, 0 pending requests, full coverage verified)")
+                                active_file_map.pop(file_id, None)
+                                if pending_disconnect_cleanups.get(file_id) is this_task:
+                                    pending_disconnect_cleanups.pop(file_id, None)
+                                cleanup_file(filepath)
+                            else:
+                                print(f"[NGINX_LOG] Decision: KEEP file_id={file_id} (quiet period cancelled or new requests registered)")
+                    except asyncio.CancelledError:
+                        pass
+                    finally:
+                        async with state_lock:
+                            if pending_disconnect_cleanups.get(file_id) is this_task:
+                                pending_disconnect_cleanups.pop(file_id, None)
+
+                existing_timer = pending_disconnect_cleanups.pop(file_id, None)
+                if existing_timer:
+                    existing_timer.cancel()
+                this_task = asyncio.create_task(delayed_quiet_period_cleanup())
+                pending_disconnect_cleanups[file_id] = this_task
             else:
-                print(f"[NGINX_LOG_DIAG] Decision: KEEP file_id={file_id} (is_full_complete={is_full_complete}, remaining_requests={remaining_requests}, file_size={file_size})")
+                coverage_info = rec.get("delivered_ranges", [])
+                print(f"[NGINX_LOG] Decision: KEEP file_id={file_id} (covered={coverage_info}, file_size={file_size}, pending_requests={remaining_requests})")
 
 class ResilientFileResponse(FileResponse):
     def __init__(self, *args, on_completed=None, on_disconnected=None, **kwargs):
@@ -1036,15 +1143,21 @@ async def get_file(request: Request, file_id: str, title: str):
                     # Verify record identity and that zero streams are active
                     if current_rec is rec and current_rec.get("active_streams", 0) == 0:
                         active_file_map.pop(file_id, None)
-                        pending_disconnect_cleanups.pop(file_id, None)
+                        if pending_disconnect_cleanups.get(file_id) is this_task:
+                            pending_disconnect_cleanups.pop(file_id, None)
                         cleanup_file(filepath)
             except asyncio.CancelledError:
                 pass
+            finally:
+                async with state_lock:
+                    if pending_disconnect_cleanups.get(file_id) is this_task:
+                        pending_disconnect_cleanups.pop(file_id, None)
 
         existing_timer = pending_disconnect_cleanups.pop(file_id, None)
         if existing_timer:
             existing_timer.cancel()
-        pending_disconnect_cleanups[file_id] = asyncio.create_task(delayed_disconnect_cleanup())
+        this_task = asyncio.create_task(delayed_disconnect_cleanup())
+        pending_disconnect_cleanups[file_id] = this_task
 
     async def on_stream_end(was_full_success: bool):
         async with state_lock:
