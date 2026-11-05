@@ -399,9 +399,11 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
     def datagram_received(self, data: bytes, addr):
         try:
             raw_text = data.decode("utf-8", errors="ignore")
+            print(f"[NGINX_LOG_DIAG] Received datagram from {addr}: {raw_text.strip()}")
             json_start = raw_text.find("{")
             json_end = raw_text.rfind("}")
             if json_start == -1 or json_end == -1:
+                print("[NGINX_LOG_DIAG] No JSON payload found in datagram")
                 return
             payload = json.loads(raw_text[json_start:json_end + 1])
 
@@ -411,21 +413,26 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
             bytes_sent = payload.get("bytes_sent", 0)
             content_length = str(payload.get("content_length", "0"))
 
+            print(f"[NGINX_LOG_DIAG] Parsed fields: file_id={file_id}, request_id={request_id}, status={status}, bytes_sent={bytes_sent}, content_length={content_length}")
+
             if not file_id or not request_id:
+                print("[NGINX_LOG_DIAG] Missing file_id or request_id; ignoring datagram")
                 return
 
             asyncio.create_task(self.handle_completion(file_id, request_id, status, bytes_sent, content_length))
         except Exception as e:
-            print(f"Error parsing Nginx access-log datagram: {e}")
+            print(f"[NGINX_LOG_DIAG] Error parsing Nginx access-log datagram: {e}")
 
     async def handle_completion(self, file_id: str, request_id: str, status: int, bytes_sent: int, content_length: str):
         async with state_lock:
             rec = active_file_map.get(file_id)
             if not rec:
+                print(f"[NGINX_LOG_DIAG] Lookup failed: file_id={file_id} not found in active_file_map")
                 return
 
             pending_set = rec.get("pending_requests", set())
             if request_id not in pending_set:
+                print(f"[NGINX_LOG_DIAG] Lookup failed: request_id={request_id} not in pending_requests for file_id={file_id} (pending: {len(pending_set)})")
                 return
 
             pending_set.discard(request_id)
@@ -439,13 +446,18 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
                 file_size > 0
             )
 
+            remaining_requests = len(pending_set)
+
             # Idempotent cleanup: delete only if full response validated and no other registered requests remain
-            if is_full_complete and len(pending_set) == 0:
+            if is_full_complete and remaining_requests == 0:
+                print(f"[NGINX_LOG_DIAG] Decision: DELETE file_id={file_id} (full completion verified, remaining_requests=0)")
                 active_file_map.pop(file_id, None)
                 timer = pending_disconnect_cleanups.pop(file_id, None)
                 if timer:
                     timer.cancel()
                 cleanup_file(rec["filepath"])
+            else:
+                print(f"[NGINX_LOG_DIAG] Decision: KEEP file_id={file_id} (is_full_complete={is_full_complete}, remaining_requests={remaining_requests}, file_size={file_size})")
 
 class ResilientFileResponse(FileResponse):
     def __init__(self, *args, on_completed=None, on_disconnected=None, **kwargs):
