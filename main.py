@@ -11,6 +11,7 @@ import socket
 import ipaddress
 import mimetypes
 import threading
+import unicodedata
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse, parse_qs
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends
@@ -444,8 +445,16 @@ async def login(request: Request):
     username = form_data.get("username", [""])[0]
     password = form_data.get("password", [""])[0]
 
+    # Normalize unicode to NFC and compare as UTF-8 encoded bytes
+    # Usernames are matched case-insensitively with leading/trailing whitespace stripped
+    norm_req_user = unicodedata.normalize('NFC', username.strip().casefold()).encode('utf-8')
+    norm_auth_user = unicodedata.normalize('NFC', AUTH_USERNAME.strip().casefold()).encode('utf-8')
 
-    if not hmac.compare_digest(username, AUTH_USERNAME) or not hmac.compare_digest(password, AUTH_PASSWORD):
+    # Passwords preserve exact characters, normalized to NFC bytes to bridge OS input differences
+    norm_req_pass = unicodedata.normalize('NFC', password).encode('utf-8')
+    norm_auth_pass = unicodedata.normalize('NFC', AUTH_PASSWORD).encode('utf-8')
+
+    if not hmac.compare_digest(norm_req_user, norm_auth_user) or not hmac.compare_digest(norm_req_pass, norm_auth_pass):
         return JSONResponse(
             status_code=401,
             content={"detail": "Invalid credentials"}
