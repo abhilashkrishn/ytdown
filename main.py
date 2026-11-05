@@ -480,31 +480,42 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
         async with state_lock:
             rec = active_file_map.get(file_id)
             if not rec:
+                print(f"[NGINX_LOG] Event ignored: file_id={file_id} not found in active_file_map (request_id={request_id})")
                 return
 
             pending_set = rec.get("pending_requests", set())
             if request_id not in pending_set:
+                print(f"[NGINX_LOG] Event ignored: request_id={request_id} not in pending_requests for file_id={file_id} (pending: {len(pending_set)})")
                 return
 
             # Always remove the completed/evaluated request ID
             pending_set.discard(request_id)
+            print(f"[NGINX_LOG] Request removed: file_id={file_id}, request_id={request_id} (remaining pending: {len(pending_set)})")
+
             file_size = rec.get("size", 0)
             delivered_ranges = rec.setdefault("delivered_ranges", [])
 
             delivered_interval = None
+            rejection_reason = None
 
             if status == 200:
                 # Full response: verify bytes_sent against content_length and file_size
-                if content_length.isdigit() and bytes_sent == int(content_length) == file_size and file_size > 0:
+                if file_size <= 0:
+                    rejection_reason = f"invalid recorded file_size ({file_size})"
+                elif not content_length.isdigit():
+                    rejection_reason = f"non-numeric content_length '{content_length}'"
+                elif int(content_length) != file_size:
+                    rejection_reason = f"content_length ({content_length}) != file_size ({file_size})"
+                elif bytes_sent != file_size:
+                    rejection_reason = f"bytes_sent ({bytes_sent}) != file_size ({file_size})"
+                else:
                     delivered_interval = (0, file_size)
-            elif status == 206 or (content_range and str(content_range).strip() not in ("", "-")):
+
+            elif status == 206:
                 # Partial response / Range event: parse and validate Content-Range header
-                rejection_reason = None
                 clean_range = str(content_range).strip() if content_range else None
 
-                if status != 206:
-                    rejection_reason = f"unexpected HTTP status {status} (expected 206)"
-                elif not clean_range or clean_range == "-":
+                if not clean_range or clean_range == "-":
                     rejection_reason = "missing or empty Content-Range header"
                 elif file_size <= 0:
                     rejection_reason = f"invalid recorded file_size ({file_size})"
@@ -532,19 +543,24 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
                             rejection_reason = f"bytes_sent ({bytes_sent}) != expected_length ({expected_length})"
                         else:
                             delivered_interval = (range_start, range_end + 1)
+            else:
+                rejection_reason = f"unsupported or non-delivery HTTP status {status}"
 
-                if delivered_interval:
-                    print(
-                        f"[NGINX_LOG] Range accepted: status={status}, bytes_sent={bytes_sent}, "
-                        f"content_length={content_length}, content_range={content_range} -> "
-                        f"interval={delivered_interval} for file_id={file_id}"
-                    )
-                else:
-                    print(
-                        f"[NGINX_LOG] Range rejected: status={status}, bytes_sent={bytes_sent}, "
-                        f"content_length={content_length}, content_range={content_range} -> "
-                        f"reason: {rejection_reason} for file_id={file_id}"
-                    )
+            # Log concise diagnostics for EVERY completion event
+            if delivered_interval:
+                print(
+                    f"[NGINX_LOG] Event accepted: request_id={request_id}, status={status}, "
+                    f"bytes_sent={bytes_sent}, content_length={content_length}, "
+                    f"content_range={content_range}, file_size={file_size} -> "
+                    f"accepted interval: {delivered_interval} for file_id={file_id}"
+                )
+            else:
+                print(
+                    f"[NGINX_LOG] Event rejected: request_id={request_id}, status={status}, "
+                    f"bytes_sent={bytes_sent}, content_length={content_length}, "
+                    f"content_range={content_range}, file_size={file_size} -> "
+                    f"reason: {rejection_reason} for file_id={file_id}"
+                )
 
             if delivered_interval:
                 rec["delivered_ranges"] = add_delivered_range(
@@ -1220,7 +1236,9 @@ async def get_file(request: Request, file_id: str, title: str):
             # Register unique request ID before returning X-Accel-Redirect
             rec = active_file_map.get(file_id)
             if rec:
-                rec.setdefault("pending_requests", set()).add(request_id)
+                pending_set = rec.setdefault("pending_requests", set())
+                pending_set.add(request_id)
+                print(f"[NGINX_LOG] Request registered: file_id={file_id}, request_id={request_id} (pending: {len(pending_set)})")
 
         internal_uri = f"{internal_base}?sv_fid={file_id}&sv_rid={request_id}"
 
