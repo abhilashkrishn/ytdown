@@ -1,4 +1,3 @@
-
 # ==========================================
 # StreamVault - GitHub Upload
 # ==========================================
@@ -23,7 +22,7 @@ function Clean-FileWhitespace {
         $bytes[2] -eq 0xBF
     )
 
-    $encoding = New-Object System.Text.UTF8Encoding($hasBom)
+    $encoding = [System.Text.UTF8Encoding]::new($hasBom)
     $content = [System.IO.File]::ReadAllText($fullPath, $encoding)
 
     # Preserve existing line-ending style
@@ -34,12 +33,8 @@ function Clean-FileWhitespace {
         $newline = "`n"
     }
 
-    # Remove trailing whitespace from every line
+    # Split into lines
     $lines = [regex]::Split($content, "\r\n|\n|\r")
-
-    for ($i = 0; $i -lt $lines.Length; $i++) {
-        $lines[$i] = $lines[$i].TrimEnd()
-    }
 
     # Remove unnecessary blank lines at EOF
     $last = $lines.Length - 1
@@ -52,13 +47,56 @@ function Clean-FileWhitespace {
         $cleaned = ""
     }
     else {
+        # Exactly one newline at EOF
         $cleaned = ($lines[0..$last] -join $newline) + $newline
     }
 
     if ($cleaned -cne $content) {
         [System.IO.File]::WriteAllText($fullPath, $cleaned, $encoding)
-        Write-Host "Cleaned: $FilePath" -ForegroundColor Green
+        Write-Host "Cleaned EOF: $FilePath" -ForegroundColor Green
     }
+}
+
+function Get-TextFiles {
+    # Include tracked and non-ignored untracked repository files
+    $files = @(git ls-files --cached --others --exclude-standard)
+
+    if ($LASTEXITCODE -ne 0) {
+        throw "Unable to retrieve repository file list."
+    }
+
+    # Text-file extensions
+    $extensions = @(
+        ".py", ".ps1", ".md", ".txt",
+        ".json", ".yml", ".yaml", ".toml",
+        ".ini", ".cfg", ".sh", ".html",
+        ".css", ".js", ".ts", ".tsx",
+        ".jsx", ".kt", ".kts", ".xml",
+        ".gradle", ".properties", ".sql",
+        ".conf", ".service", ".csv"
+    )
+
+    # Extensionless and special text files
+    $specialNames = @(
+        "Dockerfile",
+        "Makefile",
+        "Jenkinsfile",
+        ".gitignore",
+        ".gitattributes",
+        ".dockerignore",
+        ".editorconfig",
+        ".env.example"
+    )
+
+    return @(
+        $files | Where-Object {
+            $name = [System.IO.Path]::GetFileName($_)
+            $extension = [System.IO.Path]::GetExtension($_)
+
+            ($extensions -contains $extension) -or
+            ($specialNames -contains $name)
+        }
+    )
 }
 
 Write-Host "`n======================================" -ForegroundColor Cyan
@@ -68,6 +106,7 @@ Write-Host "======================================`n" -ForegroundColor Cyan
 try {
     # 1. Verify repository
     git rev-parse --is-inside-work-tree *> $null
+
     if ($LASTEXITCODE -ne 0) {
         throw "Current directory is not a Git repository."
     }
@@ -89,11 +128,16 @@ try {
     Write-Host "Repository: $remote" -ForegroundColor Gray
     Write-Host "Branch: $branch" -ForegroundColor Gray
 
-    # 4. Automatically clean known whitespace issues
-    Write-Host "`n[1/6] Cleaning whitespace..." -ForegroundColor Yellow
+    # 4. Automatically clean repository text files
+    Write-Host "`n[1/6] Cleaning whitespace and EOF..." -ForegroundColor Yellow
 
-    Clean-FileWhitespace ".\main.py"
-    Clean-FileWhitespace ".\.env.example"
+    $textFiles = @(Get-TextFiles)
+
+    foreach ($file in $textFiles) {
+        Clean-FileWhitespace -FilePath $file
+    }
+
+    Write-Host "Checked $($textFiles.Count) text files." -ForegroundColor Green
 
     # 5. Stage changes
     Write-Host "`n[2/6] Staging changes..." -ForegroundColor Yellow

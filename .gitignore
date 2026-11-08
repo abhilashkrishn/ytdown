@@ -25,6 +25,12 @@ temp_downloads/
 temp_downloads_tmpfs/
 run/
 
+# Database and mobile data
+data/
+*.db
+*.db-wal
+*.db-shm
+
 # IDE and OS
 .vscode/
 .idea/

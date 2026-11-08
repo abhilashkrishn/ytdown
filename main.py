@@ -14,6 +14,7 @@ import threading
 import unicodedata
 import shutil
 import typing
+import job_manager
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse, parse_qs, quote
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends
@@ -171,6 +172,7 @@ SESSION_EXPIRE_SECONDS = 2592000
 active_sessions = {}
 active_file_map = {}
 active_downloads = {}
+active_download_tasks: set[asyncio.Task] = set()
 format_cache = {}
 pending_disconnect_cleanups = {}
 
@@ -212,6 +214,12 @@ async def run_maintenance_tasks():
 
     for filepath in files_to_clean:
         cleanup_file(filepath)
+
+    # Prune expired mobile jobs
+    try:
+        job_manager.delete_expired_jobs()
+    except Exception as jm_err:
+        print(f"Warning: Error pruning expired mobile jobs: {jm_err}")
 
 
 async def periodic_maintenance_loop():
@@ -596,6 +604,13 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
             fully_covered = is_fully_covered(rec.get("delivered_ranges", []), file_size)
 
             if fully_covered and remaining_requests == 0:
+                jid = rec.get("job_id")
+                if jid:
+                    try:
+                        job_manager.update_job(jid, status="completed")
+                    except Exception as jm_err:
+                        print(f"[NGINX_LOG] Warning: Failed to update job {jid} to completed: {jm_err}")
+
                 print(f"[NGINX_LOG] Scheduling 5s quiet period before deletion for file_id={file_id}")
                 record_id = id(rec)
                 filepath = rec["filepath"]
@@ -678,6 +693,16 @@ async def lifespan(app: FastAPI):
                 except Exception as e:
                     print(f"Startup cleanup error: Could not remove {file_path} - {e}")
 
+    # Initialize SQLite database for mobile job management with clean-slate model
+    try:
+        job_manager.init_db()
+        cleared_count = job_manager.clear_all_jobs()
+        import mobile_api
+        mobile_api.reset_in_memory_state()
+        print(f"Mobile jobs clean slate startup complete (cleared {cleared_count} previous records).")
+    except Exception as db_init_err:
+        print(f"Warning: Failed to initialize/clear mobile jobs SQLite database: {db_init_err}")
+
     maintenance_task = asyncio.create_task(periodic_maintenance_loop())
 
     # Initialize AF_UNIX / SOCK_DGRAM listener for Nginx access-log events if running on POSIX
@@ -758,7 +783,16 @@ async def lifespan(app: FastAPI):
             except (asyncio.TimeoutError, asyncio.CancelledError):
                 pass
 
+        # Graceful shutdown of mobile background tasks
+        try:
+            import mobile_api
+            await mobile_api.shutdown_mobile_tasks()
+        except Exception as e:
+            print(f"Error during mobile tasks shutdown: {e}")
+
 app = FastAPI(title="StreamVault Premium Platform Downloader", lifespan=lifespan)
+import mobile_api
+app.include_router(mobile_api.router)
 current_dir = os.path.dirname(os.path.abspath(__file__))
 frontend_dir = os.path.join(current_dir, "frontend")
 app.mount("/static", StaticFiles(directory=frontend_dir), name="static")
@@ -928,7 +962,210 @@ async def get_options(url: str):
         extraction_semaphore.release()
 
 
-### --- SECTION 9.1: DOWNLOAD PROGRESS ROUTE (SETUP & WORKER) --- ###
+### --- SECTION 9.1: CORE DOWNLOAD ENGINE --- ###
+async def execute_download_core(
+    file_uuid: str,
+    url: str,
+    format_id: str,
+    cancel_event: threading.Event,
+    progress_callback: typing.Optional[typing.Callable[[dict], None]] = None,
+) -> dict:
+    main_loop = asyncio.get_running_loop()
+    worker_task = None
+
+    async with state_lock:
+        if file_uuid not in active_downloads:
+            active_downloads[file_uuid] = {
+                "cancel_event": cancel_event,
+                "worker_task": None
+            }
+
+    def progress_hook(d):
+        if cancel_event.is_set():
+            raise DownloadCancelled("User aborted the download.")
+
+        if d.get('status') == 'downloading':
+            total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
+            downloaded = d.get('downloaded_bytes', 0)
+            percent = round((downloaded / total) * 100, 2) if total > 0 else 0
+
+            size_mib = f"{round(total / (1024*1024), 2)} MiB" if total > 0 else "Unknown Size"
+            speed_value = d.get('speed')
+            speed_str = f"{round(speed_value / (1024*1024), 2)} MiB/s" if speed_value is not None else "Calculating..."
+            eta_val = d.get('eta')
+            eta_str = f"{eta_val}s" if eta_val is not None else "Unknown"
+
+            payload = {
+                "status": "processing",
+                "file_id": file_uuid,
+                "percent": percent,
+                "total_size": size_mib,
+                "speed": speed_str,
+                "eta": eta_str
+            }
+
+            if progress_callback:
+                main_loop.call_soon_threadsafe(progress_callback, payload)
+
+    def postprocessor_hook(d):
+        if cancel_event.is_set():
+            raise DownloadCancelled("User aborted the download.")
+
+    cookie_path = os.path.join(current_dir, "cookies.txt")
+    ydl_opts = {
+        'format': format_id,
+        'outtmpl': os.path.join(TEMP_DOWNLOAD_DIR, f"{file_uuid}.%(ext)s"),
+        'merge_output_format': 'mp4',
+        'progress_hooks': [progress_hook],
+        'postprocessor_hooks': [postprocessor_hook],
+        'quiet': True,
+        'no_warnings': True,
+        'socket_timeout': 30,
+        'max_filesize': 50 * 1024 * 1024 * 1024,
+        'remote_components': ['ejs:github']
+    }
+    if os.path.exists(cookie_path):
+        ydl_opts['cookiefile'] = cookie_path
+
+    def run_native_download():
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            return "DONE", None
+        except DownloadCancelled:
+            return "CANCELLED", None
+        except Exception as e:
+            print(f"Download processing error for {url}: {clean_terminal_ansi(str(e))}")
+            return "ERROR", "Download failed due to an internal error. Please try again."
+
+    worker_task = main_loop.run_in_executor(None, run_native_download)
+    async with state_lock:
+        if file_uuid in active_downloads:
+            active_downloads[file_uuid]["worker_task"] = worker_task
+
+    MAX_EXECUTION_TIME = 7200  # 2 hours
+
+    try:
+        try:
+            outcome, err_msg = await asyncio.wait_for(asyncio.shield(worker_task), timeout=MAX_EXECUTION_TIME)
+        except asyncio.TimeoutError:
+            cancel_event.set()
+            outcome, err_msg = "ERROR", "Download execution time limit exceeded."
+        except asyncio.CancelledError:
+            cancel_event.set()
+            outcome, err_msg = "CANCELLED", "Download Cancelled."
+            raise
+
+        if outcome == "DONE":
+            downloaded_file = None
+            for file in os.listdir(TEMP_DOWNLOAD_DIR):
+                if file.startswith(file_uuid):
+                    downloaded_file = os.path.join(TEMP_DOWNLOAD_DIR, file)
+                    break
+
+            if downloaded_file and os.path.exists(downloaded_file):
+                actual_size = os.path.getsize(downloaded_file)
+                target_path = downloaded_file
+                storage_type = "disk"
+
+                # Hybrid storage tiering: move files < 200 MB to dedicated 200 MB tmpfs
+                if actual_size < TMPFS_THRESHOLD_BYTES:
+                    tmpfs_dest = os.path.join(TMPFS_DOWNLOAD_DIR, os.path.basename(downloaded_file))
+                    try:
+                        shutil.move(downloaded_file, tmpfs_dest)
+                        target_path = tmpfs_dest
+                        storage_type = "tmpfs"
+                    except Exception as move_err:
+                        print(f"Warning: Failed to move {downloaded_file} to tmpfs: {move_err}. Retaining on disk.")
+                        # Ensure any partial or corrupted destination file on tmpfs is cleaned up
+                        cleanup_file(tmpfs_dest)
+                        target_path = downloaded_file
+                        storage_type = "disk"
+
+                async with state_lock:
+                    active_file_map[file_uuid] = {
+                        "filepath": target_path,
+                        "expires": time.time() + UNCLAIMED_FILE_EXPIRY,
+                        "storage_type": storage_type,
+                        "size": actual_size
+                    }
+                return {
+                    "status": "completed",
+                    "file_id": file_uuid,
+                    "filepath": target_path,
+                    "size": actual_size,
+                    "storage_type": storage_type
+                }
+            else:
+                return {"status": "failed", "error": "Assembly merging failure."}
+
+        elif outcome == "CANCELLED":
+            return {"status": "cancelled", "error": "Download Cancelled."}
+        else:
+            return {"status": "failed", "error": err_msg or "Download failed due to an internal error. Please try again."}
+
+    finally:
+        worker_finished = False
+        try:
+            cancel_event.set()
+            try:
+                if worker_task and not worker_task.done():
+                    await asyncio.wait_for(asyncio.shield(worker_task), timeout=15.0)
+                worker_finished = True
+            except asyncio.TimeoutError:
+                print(f"Worker task did not terminate within timeout for {file_uuid}; tracking until completion.")
+                async def background_reaper():
+                    try:
+                        if worker_task:
+                            await worker_task
+                    except Exception:
+                        pass
+                    finally:
+                        try:
+                            async with state_lock:
+                                active_downloads.pop(file_uuid, None)
+                                has_claimed = file_uuid in active_file_map
+                            if not has_claimed:
+                                for f in os.listdir(TEMP_DOWNLOAD_DIR):
+                                    if f.startswith(file_uuid):
+                                        cleanup_file(os.path.join(TEMP_DOWNLOAD_DIR, f))
+                        except Exception as reaper_err:
+                            print(f"Error during background reaper cleanup for {file_uuid}: {clean_terminal_ansi(str(reaper_err))}")
+                reaper_task = asyncio.create_task(background_reaper())
+                active_download_tasks.add(reaper_task)
+                reaper_task.add_done_callback(active_download_tasks.discard)
+            except asyncio.CancelledError:
+                raise
+            except Exception as wait_err:
+                print(f"Error while waiting for worker task termination for {file_uuid}: {clean_terminal_ansi(str(wait_err))}")
+                worker_finished = True
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            print(f"Unexpected error in cleanup_worker signalling phase: {clean_terminal_ansi(str(e))}")
+
+        # Only perform immediate file cleanup if the worker thread has actually finished
+        if worker_finished:
+            try:
+                async with state_lock:
+                    active_downloads.pop(file_uuid, None)
+                    has_claimed_file = file_uuid in active_file_map
+                if not has_claimed_file:
+                    for f in os.listdir(TEMP_DOWNLOAD_DIR):
+                        if f.startswith(file_uuid):
+                            cleanup_file(os.path.join(TEMP_DOWNLOAD_DIR, f))
+            except Exception as e:
+                print(f"Error during physical file cleanup for {file_uuid}: {clean_terminal_ansi(str(e))}")
+
+        # Notify mobile queue dispatcher that a download capacity slot has freed up
+        try:
+            import mobile_api
+            mobile_api.schedule_mobile_queue()
+        except Exception:
+            pass
+
+
+### --- SECTION 9.2: DOWNLOAD PROGRESS ROUTE (SSE ADAPTER) --- ###
 @app.get("/api/download-progress", dependencies=[Depends(verify_session)])
 async def download_progress(request: Request, url: str, format_id: str):
     try:
@@ -955,197 +1192,74 @@ async def download_progress(request: Request, url: str, format_id: str):
             }
 
         queue = asyncio.Queue()
-        main_loop = asyncio.get_running_loop()
 
-        def progress_hook(d):
-            if cancel_event.is_set():
-                raise DownloadCancelled("User aborted the download.")
+        def on_progress(payload: dict):
+            queue.put_nowait(payload)
 
-            if d['status'] == 'downloading':
-                total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
-                downloaded = d.get('downloaded_bytes', 0)
-                percent = round((downloaded / total) * 100, 2) if total > 0 else 0
+        core_task = asyncio.create_task(
+            execute_download_core(
+                file_uuid=file_uuid,
+                url=url,
+                format_id=format_id,
+                cancel_event=cancel_event,
+                progress_callback=on_progress
+            )
+        )
+        active_download_tasks.add(core_task)
+        core_task.add_done_callback(active_download_tasks.discard)
 
-                size_mib = f"{round(total / (1024*1024), 2)} MiB" if total > 0 else "Unknown Size"
-                speed_value = d.get('speed')
-                speed_str = f"{round(speed_value / (1024*1024), 2)} MiB/s" if speed_value is not None else "Calculating..."
-                eta_val = d.get('eta')
-                eta_str = f"{eta_val}s" if eta_val is not None else "Unknown"
-
-                payload = {
-                    "status": "processing",
-                    "file_id": file_uuid,
-                    "percent": percent,
-                    "total_size": size_mib,
-                    "speed": speed_str,
-                    "eta": eta_str
-                }
-
-                asyncio.run_coroutine_threadsafe(queue.put(f"data: {json.dumps(payload)}\n\n"), main_loop)
-
-        def postprocessor_hook(d):
-            if cancel_event.is_set():
-                raise DownloadCancelled("User aborted the download.")
-
-        cookie_path = os.path.join(current_dir, "cookies.txt")
-        ydl_opts = {
-            'format': format_id,
-            'outtmpl': os.path.join(TEMP_DOWNLOAD_DIR, f"{file_uuid}.%(ext)s"),
-            'merge_output_format': 'mp4',
-            'progress_hooks': [progress_hook],
-            'postprocessor_hooks': [postprocessor_hook],
-            'quiet': True,
-            'no_warnings': True,
-            'socket_timeout': 30,
-            'max_filesize': 50 * 1024 * 1024 * 1024,
-            'remote_components': ['ejs:github']
-        }
-        if os.path.exists(cookie_path):
-            ydl_opts['cookiefile'] = cookie_path
-
-        def run_native_download():
-            try:
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    ydl.download([url])
-                asyncio.run_coroutine_threadsafe(queue.put("DONE"), main_loop)
-            except DownloadCancelled:
-                asyncio.run_coroutine_threadsafe(queue.put("CANCELLED"), main_loop)
-            except Exception as e:
-                print(f"Download processing error for {url}: {clean_terminal_ansi(str(e))}")
-                asyncio.run_coroutine_threadsafe(queue.put("ERROR:Download failed due to an internal error. Please try again."), main_loop)
-
-        worker_task = main_loop.run_in_executor(None, run_native_download)
-        async with state_lock:
-            if file_uuid in active_downloads:
-                active_downloads[file_uuid]["worker_task"] = worker_task
-
-        # Soft limit for max download execution time before the client is informed of a timeout.
-        MAX_EXECUTION_TIME = 7200  # 2 hours
-        start_time = time.time()
-
-
-### --- SECTION 9.2: DOWNLOAD PROGRESS ROUTE (EVENT LOOP & CLEANUP) --- ###
         try:
             while True:
                 if await request.is_disconnected():
                     cancel_event.set()
                     break
 
-                if time.time() - start_time > MAX_EXECUTION_TIME:
-                    cancel_event.set()
-                    yield f"data: {json.dumps({'status': 'failed', 'error': 'Download execution time limit exceeded.'})}\n\n"
+                if core_task.done() and queue.empty():
                     break
 
                 try:
-                    item = await asyncio.wait_for(queue.get(), timeout=2.0)
+                    payload = await asyncio.wait_for(queue.get(), timeout=1.0)
+                    yield f"data: {json.dumps(payload)}\n\n"
                 except asyncio.TimeoutError:
                     continue
 
-                if item == "DONE":
-                    downloaded_file = None
-                    for file in os.listdir(TEMP_DOWNLOAD_DIR):
-                        if file.startswith(file_uuid):
-                            downloaded_file = os.path.join(TEMP_DOWNLOAD_DIR, file)
-                            break
+            # If client disconnected, signal cancel_event
+            if await request.is_disconnected():
+                cancel_event.set()
 
-                    if downloaded_file and os.path.exists(downloaded_file):
-                        actual_size = os.path.getsize(downloaded_file)
-                        target_path = downloaded_file
-                        storage_type = "disk"
-
-                        # Hybrid storage tiering: move files < 200 MB to dedicated 200 MB tmpfs
-                        if actual_size < TMPFS_THRESHOLD_BYTES:
-                            tmpfs_dest = os.path.join(TMPFS_DOWNLOAD_DIR, os.path.basename(downloaded_file))
-                            try:
-                                shutil.move(downloaded_file, tmpfs_dest)
-                                target_path = tmpfs_dest
-                                storage_type = "tmpfs"
-                            except Exception as move_err:
-                                print(f"Warning: Failed to move {downloaded_file} to tmpfs: {move_err}. Retaining on disk.")
-                                # Ensure any partial or corrupted destination file on tmpfs is cleaned up
-                                cleanup_file(tmpfs_dest)
-                                target_path = downloaded_file
-                                storage_type = "disk"
-
-                        async with state_lock:
-                            active_file_map[file_uuid] = {
-                                "filepath": target_path,
-                                "expires": time.time() + UNCLAIMED_FILE_EXPIRY,
-                                "storage_type": storage_type,
-                                "size": actual_size
-                            }
-                        yield f"data: {json.dumps({'status': 'completed', 'file_id': file_uuid})}\n\n"
-                    else:
-                        yield f"data: {json.dumps({'status': 'failed', 'error': 'Assembly merging failure.'})}\n\n"
-                    break
-
-                elif item == "CANCELLED":
-                    yield f"data: {json.dumps({'status': 'failed', 'error': 'Download Cancelled.'})}\n\n"
-                    break
-
-                elif item.startswith("ERROR:"):
-                    err_parts = item.split(":", 1)
-                    err_msg = err_parts[1].strip() if len(err_parts) > 1 else err_parts[0]
-                    yield f"data: {json.dumps({'status': 'failed', 'error': err_msg})}\n\n"
-                    break
-                else:
-                    yield item
-        finally:
-            async def cleanup_worker():
-                worker_finished = False
+            # Drain any remaining progress payloads before yielding final outcome
+            while not queue.empty():
                 try:
-                    # Signal the worker to stop writing (caught by progress_hook & postprocessor_hook)
-                    cancel_event.set()
+                    payload = queue.get_nowait()
+                    yield f"data: {json.dumps(payload)}\n\n"
+                except asyncio.QueueEmpty:
+                    break
 
-                    try:
-                        # Wait for worker with timeout to avoid indefinite event loop blocking
-                        await asyncio.wait_for(asyncio.shield(worker_task), timeout=15.0)
-                        worker_finished = True
-                    except asyncio.TimeoutError:
-                        print(f"Worker task did not terminate within timeout for {file_uuid}; tracking until completion.")
-                        # Wait in background so cleanup does not delete files under active I/O
-                        async def background_reaper():
-                            try:
-                                await worker_task
-                            except Exception:
-                                pass
-                            finally:
-                                try:
-                                    async with state_lock:
-                                        active_downloads.pop(file_uuid, None)
-                                        has_claimed = file_uuid in active_file_map
-                                    if not has_claimed:
-                                        for f in os.listdir(TEMP_DOWNLOAD_DIR):
-                                            if f.startswith(file_uuid):
-                                                cleanup_file(os.path.join(TEMP_DOWNLOAD_DIR, f))
-                                except Exception as reaper_err:
-                                    print(f"Error during background reaper cleanup for {file_uuid}: {clean_terminal_ansi(str(reaper_err))}")
-                        asyncio.create_task(background_reaper())
-                    except asyncio.CancelledError:
-                        raise
-                    except Exception as wait_err:
-                        print(f"Error while waiting for worker task termination for {file_uuid}: {clean_terminal_ansi(str(wait_err))}")
-                        worker_finished = True
+            # If task not finished yet and not disconnected, wait briefly for completion result
+            if not core_task.done() and not cancel_event.is_set():
+                try:
+                    res = await asyncio.wait_for(asyncio.shield(core_task), timeout=2.0)
+                except (asyncio.TimeoutError, asyncio.CancelledError):
+                    res = None
+            elif core_task.done():
+                try:
+                    res = core_task.result()
+                except Exception:
+                    res = {"status": "failed", "error": "Download failed due to an internal error. Please try again."}
+            else:
+                res = None
 
-                except asyncio.CancelledError:
-                    raise
-                except Exception as e:
-                    print(f"Unexpected error in cleanup_worker signalling phase: {clean_terminal_ansi(str(e))}")
+            if res:
+                if res.get("status") == "completed":
+                    yield f"data: {json.dumps({'status': 'completed', 'file_id': file_uuid})}\n\n"
+                elif res.get("status") == "cancelled":
+                    yield f"data: {json.dumps({'status': 'failed', 'error': 'Download Cancelled.'})}\n\n"
+                elif res.get("status") == "failed":
+                    yield f"data: {json.dumps({'status': 'failed', 'error': res.get('error', 'Download failed due to an internal error. Please try again.')})}\n\n"
 
-                # Only perform immediate file cleanup if the worker thread has actually finished
-                if worker_finished:
-                    try:
-                        async with state_lock:
-                            active_downloads.pop(file_uuid, None)
-                            has_claimed_file = file_uuid in active_file_map
-                        if not has_claimed_file:
-                            for f in os.listdir(TEMP_DOWNLOAD_DIR):
-                                if f.startswith(file_uuid):
-                                    cleanup_file(os.path.join(TEMP_DOWNLOAD_DIR, f))
-                    except Exception as e:
-                        print(f"Error during physical file cleanup for {file_uuid}: {clean_terminal_ansi(str(e))}")
-
-            asyncio.create_task(cleanup_worker())
+        finally:
+            if await request.is_disconnected():
+                cancel_event.set()
 
     return StreamingResponse(sse_event_generator(), media_type="text/event-stream")
 
@@ -1159,14 +1273,16 @@ async def cancel_download(file_id: str):
             return {"message": "Cancellation requested"}
     raise HTTPException(status_code=404, detail="Download not running")
 
-@app.get("/api/get-file", dependencies=[Depends(verify_session)])
-async def get_file(request: Request, file_id: str, title: str):
+async def deliver_file_response(request: Request, file_id: str, title: str, job_id: typing.Optional[str] = None) -> Response:
     validate_uuid(file_id)
 
     async with state_lock:
         file_record = active_file_map.get(file_id)
         if not file_record:
             raise HTTPException(status_code=404, detail="Asset expired, invalid, or already downloaded.")
+
+        if job_id:
+            file_record["job_id"] = job_id
 
         # Cancel any pending 60s disconnect cleanup timer before registering a new stream
         pending_timer = pending_disconnect_cleanups.pop(file_id, None)
@@ -1202,6 +1318,21 @@ async def get_file(request: Request, file_id: str, title: str):
     media_type = guessed_type or "application/octet-stream"
     encoded_filename = quote(f"{safe_name}{ext}")
 
+    range_header = request.headers.get("range", "").strip() if request.headers else ""
+    is_range_request = bool(range_header)
+    range_bounds = None
+    if is_range_request and range_header.startswith("bytes="):
+        parts = range_header[6:].split("-")
+        if len(parts) == 2:
+            try:
+                r_start = int(parts[0]) if parts[0] else 0
+                r_end = int(parts[1]) if parts[1] else (file_size - 1)
+                r_end = min(r_end, file_size - 1)
+                if 0 <= r_start <= r_end < file_size:
+                    range_bounds = (r_start, r_end + 1)
+            except ValueError:
+                range_bounds = None
+
     def schedule_inactivity_cleanup(rec):
         """Helper to schedule a safe 60s delayed cleanup verifying record identity."""
         async def delayed_disconnect_cleanup():
@@ -1236,8 +1367,34 @@ async def get_file(request: Request, file_id: str, title: str):
             rec["active_streams"] = max(0, rec.get("active_streams", 1) - 1)
             remaining_streams = rec["active_streams"]
 
-            # Immediate cleanup only for full non-range downloads when no other streams are active
-            if was_full_success and remaining_streams == 0:
+            # If the response completed successfully, record delivered byte range
+            if was_full_success:
+                if is_range_request and range_bounds:
+                    rec["delivered_ranges"] = add_delivered_range(
+                        rec.get("delivered_ranges", []),
+                        range_bounds[0],
+                        range_bounds[1]
+                    )
+                elif not is_range_request and file_size > 0:
+                    rec["delivered_ranges"] = add_delivered_range(
+                        rec.get("delivered_ranges", []),
+                        0,
+                        file_size
+                    )
+
+            fully_covered = is_fully_covered(rec.get("delivered_ranges", []), file_size)
+
+            # If full byte coverage is achieved, update mobile job status to completed idempotently
+            if fully_covered:
+                jid = rec.get("job_id")
+                if jid:
+                    try:
+                        job_manager.update_job(jid, status="completed")
+                    except Exception as jm_err:
+                        print(f"Warning: Failed to update job {jid} to completed: {jm_err}")
+
+            # Immediate cleanup only when fully covered and no other streams are active
+            if fully_covered and remaining_streams == 0:
                 active_file_map.pop(file_id, None)
                 timer = pending_disconnect_cleanups.pop(file_id, None)
                 if timer:
@@ -1274,14 +1431,18 @@ async def get_file(request: Request, file_id: str, title: str):
         return Response(status_code=200, headers=headers)
 
     # Mode 2: Hybrid Python ResilientFileResponse delivery with Range & 60s disconnect handling
-    is_range_request = "range" in request.headers
     return ResilientFileResponse(
         path=filepath,
         media_type=media_type,
         filename=f"{safe_name}{ext}",
-        on_completed=lambda: on_stream_end(was_full_success=(not is_range_request)),
+        status_code=206 if is_range_request else 200,
+        on_completed=lambda: on_stream_end(was_full_success=(not is_range_request or range_bounds is not None)),
         on_disconnected=lambda: on_stream_end(was_full_success=False)
     )
+
+@app.get("/api/get-file", dependencies=[Depends(verify_session)])
+async def get_file(request: Request, file_id: str, title: str):
+    return await deliver_file_response(request, file_id, title)
 
 if __name__ == "__main__":
     import uvicorn
