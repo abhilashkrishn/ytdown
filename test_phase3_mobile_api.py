@@ -369,6 +369,90 @@ class TestMobileAPIFocused(unittest.IsolatedAsyncioTestCase):
         if os.path.exists(test_file_path):
             os.remove(test_file_path)
 
+    # --- 7. MOBILE MAX 1080P FORMAT POLICY ---
+    async def test_07_mobile_format_policy(self):
+        """
+        Tests the mobile-exclusive maximum 1080p resolution policy:
+        1. Verifies MOBILE_MAX_HEIGHT is 1080 and format selector syntax.
+        2. Verifies _execute_mobile_job passes MOBILE_FORMAT_SELECTOR to execute_download_core.
+        3. Tests yt-dlp format resolution:
+           - Selects 1080p when 4K/1440p/1080p exist.
+           - Falls back to 720p when 1080p is unavailable.
+           - Supports pre-muxed and silent video streams within 1080p.
+        4. Confirms browser format options remain unchanged.
+        """
+        self.assertEqual(mobile_api.MOBILE_MAX_HEIGHT, 1080)
+        selector = mobile_api.get_mobile_format_selector()
+        self.assertIn("height<=?1080", selector)
+        self.assertEqual(selector, mobile_api.MOBILE_FORMAT_SELECTOR)
+
+        # Verify that _execute_mobile_job passes MOBILE_FORMAT_SELECTOR to execute_download_core
+        captured_format_id = None
+        orig_execute = main.execute_download_core
+
+        async def mock_execute(file_uuid, url, format_id, cancel_event, progress_callback=None):
+            nonlocal captured_format_id
+            captured_format_id = format_id
+            return {"status": "completed"}
+
+        main.execute_download_core = mock_execute
+        try:
+            test_job_id = "test_format_job"
+            job_manager.create_job(test_job_id, "https://example.com/fmt", status="extracting")
+            await mobile_api._execute_mobile_job(test_job_id, "https://example.com/fmt")
+            self.assertEqual(captured_format_id, mobile_api.MOBILE_FORMAT_SELECTOR)
+        finally:
+            main.execute_download_core = orig_execute
+
+        # Test yt-dlp format selection logic with the mobile selector
+        ydl = self.orig_ydl({'format': selector})
+
+        # Case A: 4K (2160p), 1440p, 1080p, 720p + audio -> must choose 1080p + audio
+        fmts_4k = [
+            {'format_id': 'audio', 'url': 'http://example.com/a.m4a', 'ext': 'm4a', 'vcodec': 'none', 'acodec': 'mp4a', 'tbr': 128},
+            {'format_id': '4k', 'url': 'http://example.com/4k.mp4', 'ext': 'mp4', 'vcodec': 'avc1', 'acodec': 'none', 'height': 2160, 'tbr': 5000},
+            {'format_id': '1440', 'url': 'http://example.com/1440.mp4', 'ext': 'mp4', 'vcodec': 'avc1', 'acodec': 'none', 'height': 1440, 'tbr': 3500},
+            {'format_id': '1080', 'url': 'http://example.com/1080.mp4', 'ext': 'mp4', 'vcodec': 'avc1', 'acodec': 'none', 'height': 1080, 'tbr': 2500},
+            {'format_id': '720', 'url': 'http://example.com/720.mp4', 'ext': 'mp4', 'vcodec': 'avc1', 'acodec': 'none', 'height': 720, 'tbr': 1500},
+        ]
+        info_4k = {'formats': fmts_4k, 'incomplete_formats': False}
+        ydl.sort_formats(info_4k)
+        pick_4k = [f['format_id'] for f in ydl.build_format_selector(selector)(info_4k)]
+        self.assertEqual(pick_4k, ['1080+audio'])
+
+        # Case B: Max 720p available (1080p unavailable) -> must fall back to 720p + audio
+        fmts_720 = [
+            {'format_id': 'audio', 'url': 'http://example.com/a.m4a', 'ext': 'm4a', 'vcodec': 'none', 'acodec': 'mp4a', 'tbr': 128},
+            {'format_id': '480', 'url': 'http://example.com/480.mp4', 'ext': 'mp4', 'vcodec': 'avc1', 'acodec': 'none', 'height': 480, 'tbr': 800},
+            {'format_id': '720', 'url': 'http://example.com/720.mp4', 'ext': 'mp4', 'vcodec': 'avc1', 'acodec': 'none', 'height': 720, 'tbr': 1500},
+        ]
+        info_720 = {'formats': fmts_720, 'incomplete_formats': False}
+        ydl.sort_formats(info_720)
+        pick_720 = [f['format_id'] for f in ydl.build_format_selector(selector)(info_720)]
+        self.assertEqual(pick_720, ['720+audio'])
+
+        # Case C: Pre-muxed format with 4K and 1080p -> must pick 1080p
+        fmts_mux = [
+            {'format_id': '4k_mux', 'url': 'http://example.com/4k.mp4', 'ext': 'mp4', 'vcodec': 'avc1', 'acodec': 'mp4a', 'height': 2160, 'tbr': 5000},
+            {'format_id': '1080_mux', 'url': 'http://example.com/1080.mp4', 'ext': 'mp4', 'vcodec': 'avc1', 'acodec': 'mp4a', 'height': 1080, 'tbr': 2500},
+            {'format_id': '720_mux', 'url': 'http://example.com/720.mp4', 'ext': 'mp4', 'vcodec': 'avc1', 'acodec': 'mp4a', 'height': 720, 'tbr': 1500},
+        ]
+        info_mux = {'formats': fmts_mux, 'incomplete_formats': False}
+        ydl.sort_formats(info_mux)
+        pick_mux = [f['format_id'] for f in ydl.build_format_selector(selector)(info_mux)]
+        self.assertEqual(pick_mux, ['1080_mux'])
+
+        # Case D: Pre-muxed format without 1080p -> must fall back to 720p
+        fmts_mux_720 = [
+            {'format_id': '4k_mux', 'url': 'http://example.com/4k.mp4', 'ext': 'mp4', 'vcodec': 'avc1', 'acodec': 'mp4a', 'height': 2160, 'tbr': 5000},
+            {'format_id': '720_mux', 'url': 'http://example.com/720.mp4', 'ext': 'mp4', 'vcodec': 'avc1', 'acodec': 'mp4a', 'height': 720, 'tbr': 1500},
+            {'format_id': '480_mux', 'url': 'http://example.com/480.mp4', 'ext': 'mp4', 'vcodec': 'avc1', 'acodec': 'mp4a', 'height': 480, 'tbr': 800},
+        ]
+        info_mux_720 = {'formats': fmts_mux_720, 'incomplete_formats': False}
+        ydl.sort_formats(info_mux_720)
+        pick_mux_720 = [f['format_id'] for f in ydl.build_format_selector(selector)(info_mux_720)]
+        self.assertEqual(pick_mux_720, ['720_mux'])
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -31,6 +31,23 @@ router = APIRouter(prefix="/api/mobile", tags=["mobile"])
 
 MAX_MOBILE_QUEUED_ACTIVE = 10
 
+# Mobile video format policy:
+# Enforces a maximum resolution of 1080p exclusively for mobile API downloads.
+# Selects the best available video stream (height <= 1080) paired with the best
+# audio stream, or the best pre-merged stream (height <= 1080), falling back to
+# the best available lower resolution (720p, 480p, etc.) when 1080p is unavailable.
+MOBILE_MAX_HEIGHT = 1080
+MOBILE_FORMAT_SELECTOR = (
+    f"bestvideo[height<=?{MOBILE_MAX_HEIGHT}]+bestaudio/"
+    f"best[height<=?{MOBILE_MAX_HEIGHT}]/"
+    f"bestvideo[height<=?{MOBILE_MAX_HEIGHT}]"
+)
+
+
+def get_mobile_format_selector() -> str:
+    """Returns the format selector enforcing a maximum height of 1080p for mobile downloads."""
+    return MOBILE_FORMAT_SELECTOR
+
 # Strong references to running mobile asyncio tasks
 active_mobile_tasks: Set[asyncio.Task] = set()
 
@@ -190,11 +207,11 @@ async def _execute_mobile_job(
                 status=current_status
             )
 
-        # Execute download via shared core engine
+        # Execute download via shared core engine enforcing mobile max 1080p policy
         result = await main.execute_download_core(
             file_uuid=file_uuid,
             url=url,
-            format_id="bestvideo+bestaudio/best",
+            format_id=MOBILE_FORMAT_SELECTOR,
             cancel_event=cancel_event,
             progress_callback=mobile_progress_callback
         )
