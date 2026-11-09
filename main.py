@@ -14,6 +14,7 @@ import threading
 import unicodedata
 import shutil
 import typing
+import diagnostic_timing
 import job_manager
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse, parse_qs, quote
@@ -610,6 +611,7 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
                         job_manager.update_job(jid, status="completed")
                     except Exception as jm_err:
                         print(f"[NGINX_LOG] Warning: Failed to update job {jid} to completed: {jm_err}")
+                    diagnostic_timing.tracker.record_delivery_end(jid, bytes_delivered=file_size)
 
                 print(f"[NGINX_LOG] Scheduling 5s quiet period before deletion for file_id={file_id}")
                 record_id = id(rec)
@@ -969,6 +971,7 @@ async def execute_download_core(
     format_id: str,
     cancel_event: threading.Event,
     progress_callback: typing.Optional[typing.Callable[[dict], None]] = None,
+    job_id: typing.Optional[str] = None,
 ) -> dict:
     main_loop = asyncio.get_running_loop()
     worker_task = None
@@ -990,7 +993,9 @@ async def execute_download_core(
         if extracted_title and 'title' not in captured_meta:
             captured_meta['title'] = extracted_title
 
-        if d.get('status') == 'downloading':
+        status = d.get('status')
+        if status == 'downloading':
+            diagnostic_timing.tracker.record_extraction_end(job_id)
             total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
             downloaded = d.get('downloaded_bytes', 0)
             percent = round((downloaded / total) * 100, 2) if total > 0 else 0
@@ -1014,10 +1019,13 @@ async def execute_download_core(
 
             if progress_callback:
                 main_loop.call_soon_threadsafe(progress_callback, payload)
+        elif status == 'finished':
+            diagnostic_timing.tracker.record_media_download_end(job_id)
 
     def postprocessor_hook(d):
         if cancel_event.is_set():
             raise DownloadCancelled("User aborted the download.")
+        diagnostic_timing.tracker.record_postprocess_start(job_id)
 
     cookie_path = os.path.join(current_dir, "cookies.txt")
     ydl_opts = {
@@ -1037,6 +1045,7 @@ async def execute_download_core(
 
     def run_native_download():
         try:
+            diagnostic_timing.tracker.record_extraction_start(job_id)
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = None
                 if hasattr(ydl, "extract_info"):
@@ -1045,6 +1054,7 @@ async def execute_download_core(
                     ydl.download([url])
                 if isinstance(info, dict) and info.get('title') and 'title' not in captured_meta:
                     captured_meta['title'] = info.get('title')
+            diagnostic_timing.tracker.record_postprocess_end(job_id)
             return "DONE", None
         except DownloadCancelled:
             return "CANCELLED", None
@@ -1408,6 +1418,7 @@ async def deliver_file_response(request: Request, file_id: str, title: str, job_
                         job_manager.update_job(jid, status="completed")
                     except Exception as jm_err:
                         print(f"Warning: Failed to update job {jid} to completed: {jm_err}")
+                    diagnostic_timing.tracker.record_delivery_end(jid, bytes_delivered=file_size)
 
             # Immediate cleanup only when fully covered and no other streams are active
             if fully_covered and remaining_streams == 0:

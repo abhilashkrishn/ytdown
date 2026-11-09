@@ -26,6 +26,7 @@ from pydantic import BaseModel
 
 import job_manager
 import main
+import diagnostic_timing
 
 router = APIRouter(prefix="/api/mobile", tags=["mobile"])
 
@@ -145,6 +146,7 @@ async def _execute_mobile_job(
             "task": asyncio.current_task(),
         }
     try:
+        diagnostic_timing.tracker.record_worker_start(job_id)
         if cancel_event.is_set():
             job_manager.update_job(job_id, status="cancelled")
             return
@@ -184,13 +186,19 @@ async def _execute_mobile_job(
             )
 
         # Execute download via shared core engine enforcing mobile max 1080p policy
-        result = await main.execute_download_core(
-            file_uuid=file_uuid,
-            url=url,
-            format_id=MOBILE_FORMAT_SELECTOR,
-            cancel_event=cancel_event,
-            progress_callback=mobile_progress_callback
-        )
+        exec_kwargs = {
+            "file_uuid": file_uuid,
+            "url": url,
+            "format_id": MOBILE_FORMAT_SELECTOR,
+            "cancel_event": cancel_event,
+            "progress_callback": mobile_progress_callback,
+        }
+        import inspect
+        sig = inspect.signature(main.execute_download_core)
+        if "job_id" in sig.parameters or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()):
+            exec_kwargs["job_id"] = job_id
+
+        result = await main.execute_download_core(**exec_kwargs)
 
         res_status = result.get("status")
         if res_status == "completed":
@@ -199,12 +207,19 @@ async def _execute_mobile_job(
                     main.active_file_map[file_uuid]["job_id"] = job_id
 
             final_title = result.get("title") if not captured_title_set else None
+            actual_size = result.get("size", 0)
             job_manager.update_job(
                 job_id=job_id,
                 status="ready",
                 file_id=file_uuid,
                 progress=100.0,
                 title=final_title
+            )
+            diagnostic_timing.tracker.record_ready(
+                job_id=job_id,
+                file_id=file_uuid,
+                file_size=actual_size,
+                title=final_title or (job_manager.get_job(job_id) or {}).get("title")
             )
         elif res_status == "cancelled":
             job_manager.update_job(
@@ -260,7 +275,9 @@ async def submit_job(payload: SubmitRequest):
         )
 
     job_id = str(uuid.uuid4())
+    diagnostic_timing.tracker.record_submission_received(job_id, url)
     job = job_manager.create_job(job_id=job_id, url=url, status="queued")
+    diagnostic_timing.tracker.record_queued(job_id)
 
     schedule_mobile_queue()
 
@@ -348,6 +365,9 @@ async def download_mobile_job(request: Request, job_id: str):
             raise HTTPException(status_code=404, detail="Asset expired, invalid, or already downloaded.")
 
     job_manager.update_job(job_id, status="delivering")
+
+    delivery_mode = "nginx" if main.USE_X_ACCEL_REDIRECT else "python"
+    diagnostic_timing.tracker.record_download_request(job_id, delivery_mode=delivery_mode)
 
     title = job.get("title") or "StreamVault_Download"
     return await main.deliver_file_response(request, file_id, title, job_id=job_id)

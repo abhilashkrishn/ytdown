@@ -390,7 +390,7 @@ class TestMobileAPIFocused(unittest.IsolatedAsyncioTestCase):
         captured_format_id = None
         orig_execute = main.execute_download_core
 
-        async def mock_execute(file_uuid, url, format_id, cancel_event, progress_callback=None):
+        async def mock_execute(file_uuid, url, format_id, cancel_event, progress_callback=None, **kwargs):
             nonlocal captured_format_id
             captured_format_id = format_id
             return {"status": "completed"}
@@ -477,7 +477,7 @@ class TestMobileAPIFocused(unittest.IsolatedAsyncioTestCase):
 
         main.yt_dlp.YoutubeDL = SpyYDL
 
-        async def mock_execute(file_uuid, url, format_id, cancel_event, progress_callback=None):
+        async def mock_execute(file_uuid, url, format_id, cancel_event, progress_callback=None, **kwargs):
             captured_callbacks.append(progress_callback)
             # Simulate rapid download progress events
             if progress_callback:
