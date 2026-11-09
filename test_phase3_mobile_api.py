@@ -453,6 +453,110 @@ class TestMobileAPIFocused(unittest.IsolatedAsyncioTestCase):
         pick_mux_720 = [f['format_id'] for f in ydl.build_format_selector(selector)(info_mux_720)]
         self.assertEqual(pick_mux_720, ['720_mux'])
 
+    # --- 8. PERFORMANCE OPTIMIZATIONS (FIXES 1-3) ---
+    async def test_08_performance_optimizations(self):
+        """
+        Tests the confirmed mobile performance fixes:
+        Fix 1: Duplicate extraction removed; title passed from execute_download_core / progress.
+        Fix 2: SQLite progress throttling preserved; status=None on download progress, status='processing' on transition.
+        Fix 3: EJS configuration aligned in execute_download_core.
+        """
+        # Fix 1 & 2: Verify execution without duplicate extraction and with throttled progress
+        orig_execute = main.execute_download_core
+        captured_callbacks = []
+        captured_opts = []
+
+        class SpyYDL:
+            def __init__(self, opts):
+                captured_opts.append(opts)
+            def __enter__(self): return self
+            def __exit__(self, *args): pass
+            def extract_info(self, url, download=True):
+                return {"title": "Fast Extracted Title", "formats": []}
+            def download(self, urls): pass
+
+        main.yt_dlp.YoutubeDL = SpyYDL
+
+        async def mock_execute(file_uuid, url, format_id, cancel_event, progress_callback=None):
+            captured_callbacks.append(progress_callback)
+            # Simulate rapid download progress events
+            if progress_callback:
+                # Chunk 1 with title
+                progress_callback({
+                    "status": "processing",
+                    "file_id": file_uuid,
+                    "percent": 10.0,
+                    "speed": "2.0 MiB/s",
+                    "eta": "10s",
+                    "title": "Streamed Title"
+                })
+                # Rapid bursts (<100ms)
+                for pct in range(11, 30):
+                    progress_callback({
+                        "status": "processing",
+                        "file_id": file_uuid,
+                        "percent": float(pct),
+                        "speed": "2.0 MiB/s",
+                        "eta": "9s"
+                    })
+                # Reaching 100% -> triggers processing transition
+                progress_callback({
+                    "status": "processing",
+                    "file_id": file_uuid,
+                    "percent": 100.0,
+                    "speed": "0 MiB/s",
+                    "eta": "0s"
+                })
+
+            return {
+                "status": "completed",
+                "file_id": file_uuid,
+                "title": "Streamed Title"
+            }
+
+        main.execute_download_core = mock_execute
+        try:
+            perf_job_id = "job_perf_test"
+            job_manager.create_job(perf_job_id, "https://example.com/perf")
+
+            # Spy on update_progress to verify status arguments
+            status_args_passed = []
+            orig_update_progress = job_manager.update_progress
+
+            def spy_update_progress(job_id, progress, downloaded_bytes=0, total_bytes=0, speed=None, eta=None, status=None):
+                status_args_passed.append(status)
+                return orig_update_progress(job_id, progress, downloaded_bytes, total_bytes, speed, eta, status)
+
+            job_manager.update_progress = spy_update_progress
+
+            try:
+                await mobile_api._execute_mobile_job(perf_job_id, "https://example.com/perf")
+            finally:
+                job_manager.update_progress = orig_update_progress
+
+            job_rec = job_manager.get_job(perf_job_id)
+            self.assertEqual(job_rec["status"], "ready")
+            self.assertEqual(job_rec["title"], "Streamed Title")
+
+            # Fix 2 verification:
+            # During the 11..29 rapid burst, status passed to update_progress must be None
+            # Only reaching 100% passes status="processing"
+            downloading_calls = status_args_passed[1:-1]
+            self.assertTrue(all(s is None for s in downloading_calls), f"Expected status=None during download burst, got {downloading_calls}")
+            self.assertEqual(status_args_passed[-1], "processing", "Transition to 100% must pass status='processing'")
+
+        finally:
+            main.execute_download_core = orig_execute
+
+        # Fix 3 verification: Check ydl_opts in execute_download_core contains remote_components: ['ejs:github']
+        # Call execute_download_core with cancel_event already set so it exits immediately
+        stop_ev = threading.Event()
+        stop_ev.set()
+        await main.execute_download_core("dummy_uuid", "https://example.com/test", "best", stop_ev)
+        self.assertTrue(any("remote_components" in opts and opts["remote_components"] == ['ejs:github'] for opts in captured_opts),
+                        "execute_download_core must configure 'remote_components': ['ejs:github']")
+
+
 
 if __name__ == "__main__":
     unittest.main()

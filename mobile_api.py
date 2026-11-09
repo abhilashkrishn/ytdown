@@ -131,7 +131,7 @@ async def _execute_mobile_job(
     file_uuid: Optional[str] = None,
     cancel_event: Optional[threading.Event] = None,
 ) -> None:
-    """Executes metadata extraction, download, and assembly for a mobile job."""
+    """Executes download and assembly for a mobile job via the shared core engine."""
     if file_uuid is None:
         file_uuid = str(uuid.uuid4())
     if cancel_event is None:
@@ -145,66 +145,42 @@ async def _execute_mobile_job(
             "task": asyncio.current_task(),
         }
     try:
-        # Step 1: Extraction & Metadata (status already set to 'extracting' upon claim)
-        # Use main.extraction_semaphore to honor shared extraction concurrency
-        async with main.extraction_semaphore:
-            if cancel_event.is_set():
-                job_manager.update_job(job_id, status="cancelled")
-                return
-
-            loop = asyncio.get_running_loop()
-
-            def fetch_metadata():
-                cookie_path = os.path.join(main.current_dir, "cookies.txt")
-                ydl_opts = {
-                    'quiet': True,
-                    'no_warnings': True,
-                    'extract_flat': False,
-                    'socket_timeout': 30,
-                }
-                if os.path.exists(cookie_path):
-                    ydl_opts['cookiefile'] = cookie_path
-                with main.yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    return ydl.extract_info(url, download=False)
-
-            try:
-                info = await loop.run_in_executor(None, fetch_metadata)
-                video_title = info.get("title", "Video") if info else "Video"
-            except Exception as e:
-                if cancel_event.is_set():
-                    job_manager.update_job(job_id, status="cancelled")
-                    return
-                err_text = main.clean_terminal_ansi(str(e))
-                print(f"Mobile metadata extraction error for {url}: {err_text}")
-                job_manager.update_job(
-                    job_id,
-                    status="failed",
-                    error_message="Failed to retrieve video metadata. Please verify the URL and try again."
-                )
-                return
-
         if cancel_event.is_set():
             job_manager.update_job(job_id, status="cancelled")
             return
 
-        # Update title in SQLite
-        job_manager.update_job(job_id, title=video_title)
-
-        # Step 2: Download & Assembly
+        # Transition lifecycle state to downloading
         job_manager.update_job(job_id, status="downloading")
 
+        last_status = "downloading"
+        captured_title_set = False
+
         def mobile_progress_callback(payload: dict):
+            nonlocal last_status, captured_title_set
+
+            if not captured_title_set:
+                t = payload.get("title")
+                if t:
+                    job_manager.update_job(job_id, title=t)
+                    captured_title_set = True
+
             percent = payload.get("percent", 0.0)
             speed = payload.get("speed")
             eta = payload.get("eta")
-            current_status = "processing" if percent >= 100.0 else "downloading"
+
+            # Determine genuine state transition (only pass status on actual state changes)
+            target_status = "processing" if percent >= 100.0 else "downloading"
+            transition_status = None
+            if target_status != last_status:
+                transition_status = target_status
+                last_status = target_status
 
             job_manager.update_progress(
                 job_id=job_id,
                 progress=percent,
                 speed=speed,
                 eta=eta,
-                status=current_status
+                status=transition_status
             )
 
         # Execute download via shared core engine enforcing mobile max 1080p policy
@@ -221,11 +197,14 @@ async def _execute_mobile_job(
             async with main.state_lock:
                 if file_uuid in main.active_file_map:
                     main.active_file_map[file_uuid]["job_id"] = job_id
+
+            final_title = result.get("title") if not captured_title_set else None
             job_manager.update_job(
                 job_id=job_id,
                 status="ready",
                 file_id=file_uuid,
-                progress=100.0
+                progress=100.0,
+                title=final_title
             )
         elif res_status == "cancelled":
             job_manager.update_job(

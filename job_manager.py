@@ -299,8 +299,19 @@ class JobManager:
         with self._lock:
             if is_terminal:
                 self._live_progress.pop(job_id, None)
-            elif job_id in self._live_progress:
-                live_entry = self._live_progress[job_id]
+            else:
+                live_entry = self._live_progress.setdefault(job_id, {
+                    "progress": 0.0,
+                    "downloaded_bytes": 0,
+                    "total_bytes": 0,
+                    "speed": None,
+                    "eta": None,
+                    "status": None,
+                    "updated_at": 0.0,
+                    "last_write": 0.0,
+                })
+                if status is not None:
+                    live_entry["status"] = status
                 if progress is not None:
                     live_entry["progress"] = progress
                 if downloaded_bytes is not None:
@@ -329,11 +340,12 @@ class JobManager:
         """
         Updates live progress in memory.
         Throttles SQLite writes to approximately once per second.
-        Persists immediately if a status transition occurs.
+        Persists immediately if a genuine status transition occurs.
         Returns True if SQLite was updated, False if cached in memory.
         """
         now = time.time()
         should_write_db = False
+        is_transition = False
 
         with self._lock:
             live = self._live_progress.setdefault(job_id, {
@@ -342,6 +354,7 @@ class JobManager:
                 "total_bytes": 0,
                 "speed": None,
                 "eta": None,
+                "status": None,
                 "updated_at": 0.0,
                 "last_write": 0.0,
             })
@@ -353,9 +366,11 @@ class JobManager:
             live["eta"] = eta
             live["updated_at"] = now
 
-            if status is not None:
-                # State transition specified -> persist immediately
+            if status is not None and status != live.get("status"):
+                # Genuine state transition specified -> persist immediately
+                live["status"] = status
                 should_write_db = True
+                is_transition = True
                 live["last_write"] = now
             elif (now - live.get("last_write", 0.0)) >= PROGRESS_WRITE_INTERVAL:
                 should_write_db = True
@@ -372,7 +387,7 @@ class JobManager:
             ]
             params = [progress, downloaded_bytes, total_bytes, speed, eta, now]
 
-            if status is not None:
+            if status is not None and is_transition:
                 if status not in VALID_STATUSES:
                     raise ValueError(f"Invalid status '{status}'. Must be one of {sorted(VALID_STATUSES)}")
                 updates.append("status = ?")

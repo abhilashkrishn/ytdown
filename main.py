@@ -972,6 +972,7 @@ async def execute_download_core(
 ) -> dict:
     main_loop = asyncio.get_running_loop()
     worker_task = None
+    captured_meta = {}
 
     async with state_lock:
         if file_uuid not in active_downloads:
@@ -983,6 +984,11 @@ async def execute_download_core(
     def progress_hook(d):
         if cancel_event.is_set():
             raise DownloadCancelled("User aborted the download.")
+
+        info_dict = d.get('info_dict') or {}
+        extracted_title = info_dict.get('title') or d.get('title')
+        if extracted_title and 'title' not in captured_meta:
+            captured_meta['title'] = extracted_title
 
         if d.get('status') == 'downloading':
             total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
@@ -1003,6 +1009,8 @@ async def execute_download_core(
                 "speed": speed_str,
                 "eta": eta_str
             }
+            if 'title' in captured_meta:
+                payload["title"] = captured_meta['title']
 
             if progress_callback:
                 main_loop.call_soon_threadsafe(progress_callback, payload)
@@ -1030,13 +1038,20 @@ async def execute_download_core(
     def run_native_download():
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                ydl.download([url])
+                info = None
+                if hasattr(ydl, "extract_info"):
+                    info = ydl.extract_info(url, download=True)
+                else:
+                    ydl.download([url])
+                if isinstance(info, dict) and info.get('title') and 'title' not in captured_meta:
+                    captured_meta['title'] = info.get('title')
             return "DONE", None
         except DownloadCancelled:
             return "CANCELLED", None
         except Exception as e:
-            print(f"Download processing error for {url}: {clean_terminal_ansi(str(e))}")
-            return "ERROR", "Download failed due to an internal error. Please try again."
+            err_text = clean_terminal_ansi(str(e))
+            print(f"Download processing error for {url}: {err_text}")
+            return "ERROR", f"Failed to retrieve video metadata or download stream: {err_text}"
 
     worker_task = main_loop.run_in_executor(None, run_native_download)
     async with state_lock:
@@ -1094,7 +1109,8 @@ async def execute_download_core(
                     "file_id": file_uuid,
                     "filepath": target_path,
                     "size": actual_size,
-                    "storage_type": storage_type
+                    "storage_type": storage_type,
+                    "title": captured_meta.get("title", "Video")
                 }
             else:
                 return {"status": "failed", "error": "Assembly merging failure."}
