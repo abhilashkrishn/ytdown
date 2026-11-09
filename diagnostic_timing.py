@@ -17,6 +17,51 @@ import time
 import threading
 from typing import Optional, Dict, Any, List
 from collections import OrderedDict
+from urllib.parse import urlparse, parse_qs
+
+
+def sanitize_url_for_logging(url: Optional[str]) -> str:
+    """
+    Sanitizes URL for logging:
+    - Strips authentication, tokens, cookies, fragments, and tracking query params.
+    - Preserves standard video identifiers (e.g. YouTube ?v=<id>, youtu.be/<id>, /shorts/<id>).
+    - For general domains, preserves only scheme, host, and path.
+    """
+    if not url or not isinstance(url, str):
+        return ""
+    try:
+        raw = url.strip()
+        parsed = urlparse(raw)
+        scheme = parsed.scheme.lower() if parsed.scheme else "https"
+        netloc = parsed.netloc.lower()
+        if not netloc:
+            if "/" in raw:
+                parsed = urlparse("https://" + raw)
+                scheme = "https"
+                netloc = parsed.netloc.lower()
+            else:
+                return "[SANITIZED_URL]"
+
+        # YouTube watch URL: preserve only v query param
+        if "youtube.com" in netloc and parsed.path == "/watch":
+            qs = parse_qs(parsed.query)
+            v_val = qs.get("v", [""])[0]
+            if v_val:
+                return f"{scheme}://{netloc}/watch?v={v_val}"
+            return f"{scheme}://{netloc}/watch"
+
+        # youtu.be/<id> or youtube.com/shorts/<id> or youtube.com/embed/<id>
+        if "youtu.be" in netloc or ("youtube.com" in netloc and (parsed.path.startswith("/shorts/") or parsed.path.startswith("/embed/"))):
+            clean_path = parsed.path.rstrip("/")
+            return f"{scheme}://{netloc}{clean_path}"
+
+        # Other domains: return scheme + host + path (strip query & fragment)
+        clean_path = parsed.path.rstrip("/")
+        if clean_path:
+            return f"{scheme}://{netloc}{clean_path}"
+        return f"{scheme}://{netloc}"
+    except Exception:
+        return "[SANITIZED_URL]"
 
 
 def _format_duration(duration_ms: float) -> str:
@@ -57,6 +102,7 @@ class JobTimingRecord:
         self.t_ready: Optional[float] = None
         self.t_download_req: Optional[float] = None
         self.t_delivery_end: Optional[float] = None
+        self.media_download_finalized: bool = False
 
         # Metadata
         self.url: Optional[str] = None
@@ -98,8 +144,9 @@ class DiagnosticTimingTracker:
     def record_submission_received(self, job_id: str, url: str = "") -> JobTimingRecord:
         rec = self.get_or_create(job_id)
         rec.t_submission_recv = time.perf_counter()
-        rec.url = url
-        self._log(job_id, "SUBMISSION_RECEIVED", 0.0, f"url={url}")
+        clean_url = sanitize_url_for_logging(url)
+        rec.url = clean_url
+        self._log(job_id, "SUBMISSION_RECEIVED", 0.0, f"url={clean_url}")
         return rec
 
     def record_queued(self, job_id: str) -> None:
@@ -139,24 +186,33 @@ class DiagnosticTimingTracker:
         if not job_id:
             return
         rec = self.get_or_create(job_id)
-        if rec.t_media_download_end is not None:
+        # Update media download end for subsequent finished streams until post-processing starts
+        if rec.t_postprocess_start is not None or rec.media_download_finalized:
             return
-        now = time.perf_counter()
-        rec.t_media_download_end = now
-        dl_ms = rec.stage_ms(rec.t_media_download_start, now) if rec.t_media_download_start else None
-        self._log(job_id, "MEDIA_DOWNLOAD_END", rec.elapsed_ms(now), f"media_download_duration_ms={dl_ms}")
+        rec.t_media_download_end = time.perf_counter()
+
+    def _finalize_media_download(self, rec: JobTimingRecord, boundary_time: Optional[float] = None) -> None:
+        if rec.media_download_finalized:
+            return
+        now = boundary_time if boundary_time is not None else time.perf_counter()
+        if rec.t_media_download_end is None and rec.t_media_download_start is not None:
+            rec.t_media_download_end = now
+        elif rec.t_media_download_end is not None and boundary_time is not None:
+            if rec.t_media_download_end > boundary_time:
+                rec.t_media_download_end = boundary_time
+        rec.media_download_finalized = True
+        if rec.t_media_download_start is not None and rec.t_media_download_end is not None:
+            dl_ms = rec.stage_ms(rec.t_media_download_start, rec.t_media_download_end)
+            self._log(rec.job_id, "MEDIA_DOWNLOAD_END", rec.elapsed_ms(rec.t_media_download_end), f"media_download_duration_ms={dl_ms}")
 
     def record_postprocess_start(self, job_id: Optional[str]) -> None:
         if not job_id:
             return
         rec = self.get_or_create(job_id)
-        if rec.t_media_download_end is None and rec.t_media_download_start is not None:
-            now = time.perf_counter()
-            rec.t_media_download_end = now
-            dl_ms = rec.stage_ms(rec.t_media_download_start, now)
-            self._log(job_id, "MEDIA_DOWNLOAD_END", rec.elapsed_ms(now), f"media_download_duration_ms={dl_ms}")
+        now = time.perf_counter()
+        self._finalize_media_download(rec, boundary_time=now)
         if rec.t_postprocess_start is None:
-            rec.t_postprocess_start = time.perf_counter()
+            rec.t_postprocess_start = now
             self._log(job_id, "POSTPROCESS_START", rec.elapsed_ms(rec.t_postprocess_start))
 
     def record_postprocess_end(self, job_id: Optional[str]) -> None:
@@ -164,8 +220,7 @@ class DiagnosticTimingTracker:
             return
         rec = self.get_or_create(job_id)
         now = time.perf_counter()
-        if rec.t_media_download_end is None and rec.t_media_download_start is not None:
-            rec.t_media_download_end = now
+        self._finalize_media_download(rec, boundary_time=now)
         if rec.t_postprocess_start is not None and rec.t_postprocess_end is None:
             rec.t_postprocess_end = now
             pp_ms = rec.stage_ms(rec.t_postprocess_start, now)
@@ -191,6 +246,8 @@ class DiagnosticTimingTracker:
 
     def record_download_request(self, job_id: str, delivery_mode: str = "nginx") -> None:
         rec = self.get_or_create(job_id)
+        if rec.t_download_req is not None:
+            return
         rec.t_download_req = time.perf_counter()
         rec.delivery_mode = delivery_mode
         poll_delay_ms = rec.stage_ms(rec.t_ready, rec.t_download_req) if rec.t_ready else None
@@ -229,6 +286,8 @@ class DiagnosticTimingTracker:
         ext_ms = rec.stage_ms(rec.t_extraction_start, rec.t_extraction_end) if (rec.t_extraction_start and rec.t_extraction_end) else 0.0
         dl_ms = rec.stage_ms(rec.t_media_download_start, rec.t_media_download_end) if (rec.t_media_download_start and rec.t_media_download_end) else 0.0
         pp_ms = rec.stage_ms(rec.t_postprocess_start, rec.t_postprocess_end) if (rec.t_postprocess_start and rec.t_postprocess_end) else 0.0
+        last_prep_boundary = rec.t_postprocess_end or rec.t_media_download_end or rec.t_worker_start
+        staging_ms = rec.stage_ms(last_prep_boundary, rec.t_ready) if (last_prep_boundary and rec.t_ready) else 0.0
         ready_elapsed = rec.elapsed_ms(rec.t_ready)
 
         print("\n" + "=" * 78)
@@ -245,7 +304,9 @@ class DiagnosticTimingTracker:
         print(f"  4. yt-dlp Extraction:        +{ext_ms:.2f} ms  [Metadata & Formats]")
         print(f"  5. Media Download:           +{dl_ms:.2f} ms  [Stream Download]")
         print(f"  6. FFmpeg / Post-process:    +{pp_ms:.2f} ms  [Assembly / Muxing]")
-        print(f"  7. Job READY:                elapsed {ready_elapsed:.2f} ms ({_format_duration(ready_elapsed)})")
+        print(f"  7. Job READY:                +{staging_ms:.2f} ms  (elapsed: {ready_elapsed:.2f} ms) [Assembly & Tiering]")
+        print("-" * 78)
+        print(f"SERVER PREPARATION ELAPSED:    {ready_elapsed:.2f} ms ({_format_duration(ready_elapsed)})")
         print("=" * 78 + "\n")
 
     def _print_full_summary(self, rec: JobTimingRecord) -> None:
@@ -253,6 +314,8 @@ class DiagnosticTimingTracker:
         ext_ms = rec.stage_ms(rec.t_extraction_start, rec.t_extraction_end) if (rec.t_extraction_start and rec.t_extraction_end) else 0.0
         dl_ms = rec.stage_ms(rec.t_media_download_start, rec.t_media_download_end) if (rec.t_media_download_start and rec.t_media_download_end) else 0.0
         pp_ms = rec.stage_ms(rec.t_postprocess_start, rec.t_postprocess_end) if (rec.t_postprocess_start and rec.t_postprocess_end) else 0.0
+        last_prep_boundary = rec.t_postprocess_end or rec.t_media_download_end or rec.t_worker_start
+        staging_ms = rec.stage_ms(last_prep_boundary, rec.t_ready) if (last_prep_boundary and rec.t_ready) else 0.0
         prep_elapsed = rec.elapsed_ms(rec.t_ready) if rec.t_ready else 0.0
 
         poll_delay = rec.stage_ms(rec.t_ready, rec.t_download_req) if (rec.t_ready and rec.t_download_req) else 0.0
@@ -277,7 +340,7 @@ class DiagnosticTimingTracker:
         print(f"  4. yt-dlp Extraction:        +{ext_ms:.2f} ms  [Metadata & Formats]")
         print(f"  5. Media Download:           +{dl_ms:.2f} ms  [Stream Download]")
         print(f"  6. FFmpeg / Post-process:    +{pp_ms:.2f} ms  [Assembly / Muxing]")
-        print(f"  7. Job READY:                +{prep_elapsed:.2f} ms  (elapsed: {prep_elapsed:.2f} ms)")
+        print(f"  7. Job READY:                +{staging_ms:.2f} ms  (elapsed: {prep_elapsed:.2f} ms) [Assembly & Tiering]")
         print(f"  8. Client Download Request:  +{poll_delay:.2f} ms  [Polling / Discovery Delay]")
         print(f"  9. Delivery Complete:        +{deliv_ms:.2f} ms  [Transfer Time | Speed: {speed_mb_s} MB/s]")
         print("-" * 78)

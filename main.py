@@ -1025,7 +1025,9 @@ async def execute_download_core(
     def postprocessor_hook(d):
         if cancel_event.is_set():
             raise DownloadCancelled("User aborted the download.")
-        diagnostic_timing.tracker.record_postprocess_start(job_id)
+        status = d.get('status') if isinstance(d, dict) else None
+        if status in (None, 'started'):
+            diagnostic_timing.tracker.record_postprocess_start(job_id)
 
     cookie_path = os.path.join(current_dir, "cookies.txt")
     ydl_opts = {
