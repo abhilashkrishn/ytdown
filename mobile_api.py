@@ -206,7 +206,7 @@ async def _execute_mobile_job(
                 if file_uuid in main.active_file_map:
                     main.active_file_map[file_uuid]["job_id"] = job_id
 
-            final_title = result.get("title") if not captured_title_set else None
+            final_title = result.get("title")
             actual_size = result.get("size", 0)
             job_manager.update_job(
                 job_id=job_id,

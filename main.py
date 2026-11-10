@@ -394,6 +394,57 @@ def cleanup_file(filepath: str):
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "", name)
 
+def clean_media_title(info: dict) -> str:
+    """
+    Platform-aware video title resolver.
+    Extracts and cleans video titles for display, download filenames, and history:
+    - YouTube: Preserves info['title'] exactly as returned by yt-dlp.
+    - Instagram: If title is missing or matches generic patterns ('Video by ...', 'Post by ...'),
+      uses the first meaningful line of description when available; preserves genuine titles.
+    - Facebook: Confidently detects and removes leading engagement statistics (views, reactions,
+      shares, comments) while preserving the actual video title and internal punctuation.
+    - Other platforms / Fallback: Preserves the title, or falls back to 'Video'.
+    """
+    if not isinstance(info, dict):
+        return "Video"
+
+    raw_title = (info.get("title") or "").strip()
+    extractor = (info.get("extractor") or info.get("extractor_key") or "").lower()
+    webpage_url = (info.get("webpage_url") or info.get("original_url") or info.get("url") or "").lower()
+
+    # 1. YouTube handling: strictly preserve existing title behaviour unchanged
+    if "youtube" in extractor or "youtube.com" in webpage_url or "youtu.be" in webpage_url:
+        return raw_title if raw_title else "video"
+
+    # 2. Instagram handling
+    is_instagram = "instagram" in extractor or "instagram.com" in webpage_url
+    generic_ig_pattern = r'^(?:Video|Post|Story)\s+(?:by\s+.+|\d+)$'
+    if is_instagram or re.match(r'^(?:Video|Post|Story)\s+by\s+', raw_title, re.IGNORECASE):
+        is_generic = not raw_title or bool(re.match(generic_ig_pattern, raw_title, re.IGNORECASE))
+        if is_generic:
+            description = info.get("description") or ""
+            # Prefer the first meaningful line of the description
+            meaningful_lines = [line.strip() for line in description.splitlines() if line.strip()]
+            if meaningful_lines:
+                return meaningful_lines[0]
+            return raw_title if raw_title else "Video"
+        return raw_title
+
+    # 3. Facebook handling
+    is_facebook = "facebook" in extractor or "facebook.com" in webpage_url or "fb.watch" in webpage_url
+    if is_facebook or ("|" in raw_title and re.search(r'\b(?:views?|reactions?|shares?|comments?)\b', raw_title, re.IGNORECASE)):
+        if "|" in raw_title:
+            prefix, rest = raw_title.split("|", 1)
+            single_metric = r'\d+(?:[.,]\d+)?\s*[kKmMbB]?\s+(?:views?|reactions?|shares?|comments?|likes?)'
+            sep = r'\s*[·•,\-]\s*'
+            engagement_prefix_pattern = rf'^\s*(?:{single_metric}(?:{sep}|\s+)*)+\s*$'
+            if re.match(engagement_prefix_pattern, prefix, re.IGNORECASE) and rest.strip():
+                return rest.strip()
+        return raw_title if raw_title else "Video"
+
+    # 4. Fallback for other platforms
+    return raw_title if raw_title else "Video"
+
 def clean_terminal_ansi(text: str) -> str:
     return re.sub(r'\x1b\[[0-9;]*m', '', str(text))
 
@@ -903,7 +954,7 @@ async def get_options(url: str):
     def fetch_metadata():
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
-            video_title = info.get('title', 'video')
+            video_title = clean_media_title(info) if isinstance(info, dict) else "video"
             raw_formats = info.get('formats', [])
 
             processed_options = []
@@ -989,7 +1040,13 @@ async def execute_download_core(
             raise DownloadCancelled("User aborted the download.")
 
         info_dict = d.get('info_dict') or {}
-        extracted_title = info_dict.get('title') or d.get('title')
+        if info_dict:
+            extracted_title = clean_media_title(info_dict)
+        elif d.get('title'):
+            extracted_title = clean_media_title({'title': d.get('title')})
+        else:
+            extracted_title = None
+
         if extracted_title and 'title' not in captured_meta:
             captured_meta['title'] = extracted_title
 
@@ -1054,8 +1111,10 @@ async def execute_download_core(
                     info = ydl.extract_info(url, download=True)
                 else:
                     ydl.download([url])
-                if isinstance(info, dict) and info.get('title') and 'title' not in captured_meta:
-                    captured_meta['title'] = info.get('title')
+                if isinstance(info, dict):
+                    resolved_title = clean_media_title(info)
+                    if resolved_title:
+                        captured_meta['title'] = resolved_title
             diagnostic_timing.tracker.record_postprocess_end(job_id)
             return "DONE", None
         except DownloadCancelled:
