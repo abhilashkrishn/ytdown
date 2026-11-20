@@ -1145,11 +1145,20 @@ async def execute_download_core(
         if outcome == "DONE":
             downloaded_file = None
             for file in os.listdir(TEMP_DOWNLOAD_DIR):
-                if file.startswith(file_uuid):
+                if file.startswith(file_uuid) and not file.endswith((".part", ".ytdl")):
                     downloaded_file = os.path.join(TEMP_DOWNLOAD_DIR, file)
                     break
 
             if downloaded_file and os.path.exists(downloaded_file):
+                raw_ext = os.path.splitext(downloaded_file)[1].lower()
+                if raw_ext not in {".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi"}:
+                    normalized_path = os.path.join(TEMP_DOWNLOAD_DIR, f"{file_uuid}.mp4")
+                    try:
+                        os.replace(downloaded_file, normalized_path)
+                        downloaded_file = normalized_path
+                    except Exception as ren_err:
+                        print(f"Warning: Failed to normalize extension of {downloaded_file}: {ren_err}")
+
                 actual_size = os.path.getsize(downloaded_file)
                 target_path = downloaded_file
                 storage_type = "disk"
@@ -1394,16 +1403,25 @@ async def deliver_file_response(request: Request, file_id: str, title: str, job_
             active_file_map.pop(file_id, None)
             raise HTTPException(status_code=404, detail="Asset no longer exists on disk.")
 
-    safe_name = sanitize_filename(title)
+    safe_name = sanitize_filename(title).strip().rstrip(". ")
+
+    VALID_VIDEO_EXTENSIONS = {".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi"}
+    raw_ext = os.path.splitext(filepath)[1].lower()
+    ext = raw_ext if raw_ext in VALID_VIDEO_EXTENSIONS else ".mp4"
+
+    if safe_name.lower().endswith(ext.lower()):
+        safe_name = safe_name[:-len(ext)].rstrip(". ")
     if not safe_name:
         safe_name = "StreamVault_Download"
 
-    ext = os.path.splitext(filepath)[1].lower()
-    if not ext:
-        ext = ".mp4"
-    guessed_type, _ = mimetypes.guess_type(filepath)
-    media_type = guessed_type or "application/octet-stream"
+    guessed_type, _ = mimetypes.guess_type(f"video{ext}")
+    media_type = guessed_type or ("video/mp4" if ext == ".mp4" else "application/octet-stream")
     encoded_filename = quote(f"{safe_name}{ext}")
+    ascii_safe_name = re.sub(r'\s+', ' ', re.sub(r'[^\x20-\x7E]', ' ', safe_name).replace('"', '')).strip(". ")
+    if not ascii_safe_name:
+        ascii_safe_name = "StreamVault_Download"
+
+    content_disposition = f'attachment; filename="{ascii_safe_name}{ext}"; filename*=UTF-8\'\'{encoded_filename}'
 
     range_header = request.headers.get("range", "").strip() if request.headers else ""
     is_range_request = bool(range_header)
@@ -1513,15 +1531,20 @@ async def deliver_file_response(request: Request, file_id: str, title: str, job_
         headers = {
             "X-Accel-Redirect": internal_uri,
             "Content-Type": media_type,
-            "Content-Disposition": f"attachment; filename*=UTF-8''{encoded_filename}",
+            "Content-Disposition": content_disposition,
             "Accept-Ranges": "bytes"
         }
         return Response(status_code=200, headers=headers)
 
     # Mode 2: Hybrid Python ResilientFileResponse delivery with Range & 60s disconnect handling
+    headers = {
+        "Content-Disposition": content_disposition,
+        "Accept-Ranges": "bytes"
+    }
     return ResilientFileResponse(
         path=filepath,
         media_type=media_type,
+        headers=headers,
         filename=f"{safe_name}{ext}",
         status_code=206 if is_range_request else 200,
         on_completed=lambda: on_stream_end(was_full_success=(not is_range_request or range_bounds is not None)),

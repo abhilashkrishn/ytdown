@@ -208,12 +208,18 @@ async def _execute_mobile_job(
 
             final_title = result.get("title")
             actual_size = result.get("size", 0)
+            if (not actual_size or actual_size <= 0) and result.get("filepath") and os.path.exists(result.get("filepath")):
+                try:
+                    actual_size = os.path.getsize(result.get("filepath"))
+                except OSError:
+                    pass
             job_manager.update_job(
                 job_id=job_id,
                 status="ready",
                 file_id=file_uuid,
                 progress=100.0,
-                title=final_title
+                title=final_title,
+                total_bytes=int(actual_size) if actual_size else 0
             )
             diagnostic_timing.tracker.record_ready(
                 job_id=job_id,
@@ -294,6 +300,17 @@ async def get_job_status(job_id: str):
     job = job_manager.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
+    if job.get("status") == "ready" and (job.get("total_bytes") is None or job.get("total_bytes") <= 0):
+        file_id = job.get("file_id")
+        if file_id and file_id in main.active_file_map:
+            fpath = main.active_file_map[file_id].get("filepath")
+            if fpath and os.path.exists(fpath):
+                try:
+                    fsize = os.path.getsize(fpath)
+                    job["total_bytes"] = int(fsize)
+                    job_manager.update_job(job_id, total_bytes=int(fsize))
+                except OSError:
+                    pass
     return job
 
 
