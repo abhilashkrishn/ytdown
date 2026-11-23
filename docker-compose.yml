@@ -16,7 +16,7 @@ services:
       - ./data:/app/data
       - ./logs:/app/logs
       - ./.env:/app/.env:ro
-      - ./cookies.txt:/app/cookies.txt
+      - ./cookies.txt:/app/cookies.txt:ro
     init: true
     security_opt:
       - no-new-privileges:true
