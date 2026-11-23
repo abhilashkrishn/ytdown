@@ -191,18 +191,29 @@ extraction_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTIONS)
 ### --- SECTION 4: MAINTENANCE TASKS --- ###
 async def run_maintenance_tasks():
     now = time.time()
+    files_to_clean = []
+    jobs_to_expire = []
 
     async with state_lock:
         expired_sessions = [sid for sid, exp in active_sessions.items() if now > exp]
         for sid in expired_sessions:
             active_sessions.pop(sid, None)
 
-        expired_files = [fid for fid, rec in active_file_map.items() if now > rec["expires"]]
-        files_to_clean = []
-        for fid in expired_files:
-            rec = active_file_map.pop(fid, None)
-            if rec:
-                files_to_clean.append(rec["filepath"])
+        for fid, rec in list(active_file_map.items()):
+            active_streams = rec.get("active_streams", 0)
+            pending_requests = len(rec.get("pending_requests", set()))
+            is_expired = now > rec.get("expires", 0)
+            fpath = rec.get("filepath")
+            is_missing = not fpath or not os.path.exists(fpath)
+
+            if is_expired or is_missing:
+                # Active delivery must never be invalidated by maintenance
+                if active_streams > 0 or pending_requests > 0:
+                    continue
+                active_file_map.pop(fid, None)
+                if fpath:
+                    files_to_clean.append(fpath)
+                jobs_to_expire.append((rec.get("job_id"), fid))
 
         expired_formats = [u for u, rec in format_cache.items() if now > rec["expires"]]
         for u in expired_formats:
@@ -215,6 +226,12 @@ async def run_maintenance_tasks():
 
     for filepath in files_to_clean:
         cleanup_file(filepath)
+
+    for jid, fid in jobs_to_expire:
+        try:
+            job_manager.expire_job_asset(job_id=jid, file_id=fid)
+        except Exception as expire_err:
+            print(f"Warning: Failed to expire mobile job {jid or fid}: {expire_err}")
 
     # Prune expired mobile jobs
     try:
@@ -1182,7 +1199,8 @@ async def execute_download_core(
                         "filepath": target_path,
                         "expires": time.time() + UNCLAIMED_FILE_EXPIRY,
                         "storage_type": storage_type,
-                        "size": actual_size
+                        "size": actual_size,
+                        "job_id": job_id
                     }
                 return {
                     "status": "completed",
@@ -1375,10 +1393,12 @@ async def deliver_file_response(request: Request, file_id: str, title: str, job_
     async with state_lock:
         file_record = active_file_map.get(file_id)
         if not file_record:
+            job_manager.expire_job_asset(job_id=job_id, file_id=file_id)
             raise HTTPException(status_code=404, detail="Asset expired, invalid, or already downloaded.")
 
         if job_id:
             file_record["job_id"] = job_id
+        resolved_job_id = file_record.get("job_id") or job_id
 
         # Cancel any pending 60s disconnect cleanup timer before registering a new stream
         pending_timer = pending_disconnect_cleanups.pop(file_id, None)
@@ -1396,11 +1416,13 @@ async def deliver_file_response(request: Request, file_id: str, title: str, job_
             file_record["active_streams"] = max(0, file_record["active_streams"] - 1)
             active_file_map.pop(file_id, None)
             cleanup_file(filepath)
+            job_manager.expire_job_asset(job_id=resolved_job_id, file_id=file_id)
             raise HTTPException(status_code=404, detail="Asset has expired.")
 
         if not os.path.exists(filepath):
             file_record["active_streams"] = max(0, file_record["active_streams"] - 1)
             active_file_map.pop(file_id, None)
+            job_manager.expire_job_asset(job_id=resolved_job_id, file_id=file_id)
             raise HTTPException(status_code=404, detail="Asset no longer exists on disk.")
 
     safe_name = sanitize_filename(title).strip().rstrip(". ")

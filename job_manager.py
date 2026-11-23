@@ -22,9 +22,10 @@ VALID_STATUSES = {
     "completed",
     "failed",
     "cancelled",
+    "asset_expired",
 }
 
-TERMINAL_STATUSES = {"completed", "failed", "cancelled"}
+TERMINAL_STATUSES = {"completed", "failed", "cancelled", "asset_expired"}
 
 def get_default_db_path() -> str:
     env_path = os.getenv("STREAMVAULT_DB_PATH")
@@ -406,20 +407,115 @@ class JobManager:
 
         return False
 
+    def expire_job_asset(
+        self,
+        job_id: Optional[str] = None,
+        file_id: Optional[str] = None,
+        error_message: str = "Asset expired on server.",
+    ) -> bool:
+        """
+        Transitions a mobile job from 'ready' to 'asset_expired' if its physical
+        asset has expired or disappeared.
+        Does NOT overwrite jobs that are already completed, failed, cancelled,
+        or actively delivering.
+        Returns True if a job was transitioned, False otherwise.
+        """
+        if not job_id and not file_id:
+            return False
+
+        now = time.time()
+        where_clauses = []
+        params = [error_message, now, now]
+
+        if job_id and file_id:
+            where_clauses.append("(job_id = ? OR file_id = ?)")
+            params.extend([job_id, file_id])
+        elif job_id:
+            where_clauses.append("job_id = ?")
+            params.append(job_id)
+        else:
+            where_clauses.append("file_id = ?")
+            params.append(file_id)
+
+        sql = f"""
+            UPDATE mobile_jobs
+            SET status = 'asset_expired',
+                error_message = ?,
+                updated_at = ?,
+                completed_at = COALESCE(completed_at, ?)
+            WHERE {' AND '.join(where_clauses)}
+              AND status = 'ready';
+        """
+
+        with self._get_connection() as conn:
+            cursor = conn.execute(sql, tuple(params))
+            updated = cursor.rowcount > 0
+
+        if updated:
+            with self._lock:
+                if job_id:
+                    self._live_progress.pop(job_id, None)
+
+        return updated
+
+    def get_job_by_file_id(self, file_id: str) -> Optional[Dict[str, Any]]:
+        """Retrieves a job by its associated file_id."""
+        with self._get_connection() as conn:
+            cursor = conn.execute(
+                "SELECT * FROM mobile_jobs WHERE file_id = ? ORDER BY created_at DESC LIMIT 1;",
+                (file_id,),
+            )
+            row = cursor.fetchone()
+        if not row:
+            return None
+        return dict(row)
+
     def delete_expired_jobs(self, max_age_seconds: float = 86400) -> int:
         """
-        Deletes terminal jobs (completed, failed, cancelled) or abandoned jobs
-        older than max_age_seconds.
+        Transitions stale non-terminal jobs older than max_age_seconds to appropriate
+        terminal states ('asset_expired' for ready, 'failed' for in-flight/stale),
+        then deletes terminal jobs older than max_age_seconds. Active jobs are never
+        silently deleted.
         """
-        cutoff = time.time() - max_age_seconds
+        now = time.time()
+        cutoff = now - max_age_seconds
+
         with self._get_connection() as conn:
+            # 1. Stale 'ready' jobs past cutoff transition to 'asset_expired'
+            conn.execute(
+                """
+                UPDATE mobile_jobs
+                SET status = 'asset_expired',
+                    error_message = COALESCE(error_message, 'Asset expired on server.'),
+                    updated_at = ?,
+                    completed_at = ?
+                WHERE status = 'ready' AND updated_at < ?;
+                """,
+                (now, now, cutoff),
+            )
+
+            # 2. Other stale active/non-terminal jobs past cutoff transition to 'failed'
+            conn.execute(
+                """
+                UPDATE mobile_jobs
+                SET status = 'failed',
+                    error_message = COALESCE(error_message, 'Job timed out or abandoned.'),
+                    updated_at = ?,
+                    completed_at = ?
+                WHERE status IN ('queued', 'extracting', 'downloading', 'processing', 'delivering')
+                  AND updated_at < ?;
+                """,
+                (now, now, cutoff),
+            )
+
+            # 3. Delete ONLY terminal jobs whose completed_at/updated_at is older than cutoff
             cursor = conn.execute(
                 """
                 DELETE FROM mobile_jobs
-                WHERE (status IN ('completed', 'failed', 'cancelled') AND COALESCE(completed_at, updated_at) < ?)
-                   OR (updated_at < ?);
+                WHERE status IN ('completed', 'failed', 'cancelled', 'asset_expired')
+                  AND COALESCE(completed_at, updated_at) < ?;
                 """,
-                (cutoff, cutoff),
+                (cutoff,),
             )
             deleted_count = cursor.rowcount
 
@@ -629,3 +725,17 @@ def claim_next_queued_job() -> Optional[Dict[str, Any]]:
 
 def unclaim_job(job_id: str) -> None:
     get_job_manager().unclaim_job(job_id)
+
+
+def expire_job_asset(
+    job_id: Optional[str] = None,
+    file_id: Optional[str] = None,
+    error_message: str = "Asset expired on server.",
+) -> bool:
+    return get_job_manager().expire_job_asset(
+        job_id=job_id, file_id=file_id, error_message=error_message
+    )
+
+
+def get_job_by_file_id(file_id: str) -> Optional[Dict[str, Any]]:
+    return get_job_manager().get_job_by_file_id(file_id=file_id)

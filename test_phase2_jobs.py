@@ -238,8 +238,17 @@ class TestJobManager(unittest.TestCase):
         self.assertEqual(cancel_res["status"], "cancelled")
         self.assertIsNotNone(cancel_res["completed_at"])
 
+        # Test asset_expired transition and completed_at
+        expired_job_id = "job_state_expired"
+        self.manager.create_job(expired_job_id, "https://youtube.com/watch?v=exp123")
+        self.manager.update_job(expired_job_id, status="ready")
+        exp_res = self.manager.update_job(expired_job_id, status="asset_expired", error_message="Asset expired on server.")
+        self.assertEqual(exp_res["status"], "asset_expired")
+        self.assertEqual(exp_res["error_message"], "Asset expired on server.")
+        self.assertIsNotNone(exp_res["completed_at"])
+
         # Verify all valid statuses from requirement are tested
-        all_tested = set(expected_sequence) | {"failed", "cancelled"}
+        all_tested = set(expected_sequence) | {"failed", "cancelled", "asset_expired"}
         self.assertEqual(all_tested, VALID_STATUSES)
 
     # --- 4. PROGRESS THROTTLING TESTS ---

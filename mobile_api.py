@@ -300,17 +300,42 @@ async def get_job_status(job_id: str):
     job = job_manager.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
-    if job.get("status") == "ready" and (job.get("total_bytes") is None or job.get("total_bytes") <= 0):
+
+    status = job.get("status")
+    if status == "ready":
         file_id = job.get("file_id")
-        if file_id and file_id in main.active_file_map:
-            fpath = main.active_file_map[file_id].get("filepath")
-            if fpath and os.path.exists(fpath):
-                try:
-                    fsize = os.path.getsize(fpath)
-                    job["total_bytes"] = int(fsize)
-                    job_manager.update_job(job_id, total_bytes=int(fsize))
-                except OSError:
-                    pass
+        is_valid = False
+        actual_size = None
+
+        if file_id:
+            async with main.state_lock:
+                rec = main.active_file_map.get(file_id)
+                now = time.time()
+                if rec and now <= rec.get("expires", 0):
+                    fpath = rec.get("filepath")
+                    if fpath and os.path.exists(fpath):
+                        is_valid = True
+                        try:
+                            actual_size = os.path.getsize(fpath)
+                        except OSError:
+                            pass
+                elif rec:
+                    # In active_file_map but expired or physical file is missing
+                    main.active_file_map.pop(file_id, None)
+                    if rec.get("filepath"):
+                        main.cleanup_file(rec["filepath"])
+
+        if not is_valid:
+            # Asset is expired or missing; transition atomically from ready to asset_expired
+            job_manager.expire_job_asset(job_id=job_id, file_id=file_id)
+            refreshed = job_manager.get_job(job_id)
+            return refreshed or {**job, "status": "asset_expired", "error_message": "Asset expired on server."}
+
+        # Asset is valid and physically present
+        if actual_size and (job.get("total_bytes") is None or job.get("total_bytes") <= 0):
+            job["total_bytes"] = int(actual_size)
+            job_manager.update_job(job_id, total_bytes=int(actual_size))
+
     return job
 
 
@@ -367,6 +392,9 @@ async def download_mobile_job(request: Request, job_id: str):
         raise HTTPException(status_code=404, detail="Job not found")
 
     status = job.get("status")
+    if status == "asset_expired":
+        raise HTTPException(status_code=404, detail="Asset expired on server.")
+
     if status in ("failed", "cancelled"):
         raise HTTPException(status_code=400, detail=f"Cannot download job in '{status}' state.")
 
@@ -375,10 +403,18 @@ async def download_mobile_job(request: Request, job_id: str):
 
     file_id = job.get("file_id")
     if not file_id:
+        job_manager.expire_job_asset(job_id=job_id)
         raise HTTPException(status_code=404, detail="Asset not found for this job.")
 
     async with main.state_lock:
-        if file_id not in main.active_file_map:
+        rec = main.active_file_map.get(file_id)
+        now = time.time()
+        if not rec or now >= rec.get("expires", 0) or not rec.get("filepath") or not os.path.exists(rec["filepath"]):
+            if rec:
+                main.active_file_map.pop(file_id, None)
+                if rec.get("filepath"):
+                    main.cleanup_file(rec["filepath"])
+            job_manager.expire_job_asset(job_id=job_id, file_id=file_id)
             raise HTTPException(status_code=404, detail="Asset expired, invalid, or already downloaded.")
 
     job_manager.update_job(job_id, status="delivering")
