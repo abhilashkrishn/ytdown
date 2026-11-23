@@ -340,19 +340,30 @@ async def get_job_status(job_id: str):
             async with main.state_lock:
                 rec = main.active_file_map.get(file_id)
                 now = time.time()
-                if rec and now <= rec.get("expires", 0):
-                    fpath = rec.get("filepath")
-                    if fpath and os.path.exists(fpath):
+                if rec:
+                    if rec.get("is_migrating"):
+                        # Asset is actively migrating between storage tiers (tmpfs <-> disk); hold valid
                         is_valid = True
-                        try:
-                            actual_size = os.path.getsize(fpath)
-                        except OSError:
-                            pass
-                elif rec:
-                    # In active_file_map but expired or physical file is missing
-                    main.active_file_map.pop(file_id, None)
-                    if rec.get("filepath"):
-                        main.cleanup_file(rec["filepath"], trigger="status_check_missing_or_expired", job_id=job_id, file_id=file_id)
+                    elif now <= rec.get("expires", 0):
+                        fpath = rec.get("filepath")
+                        if fpath and os.path.exists(fpath):
+                            is_valid = True
+                            job_bytes = job.get("total_bytes")
+                            rec_size = rec.get("size")
+                            if job_bytes and job_bytes > 0:
+                                actual_size = job_bytes
+                            elif rec_size and rec_size > 0:
+                                actual_size = rec_size
+                            else:
+                                try:
+                                    actual_size = os.path.getsize(fpath)
+                                except OSError:
+                                    pass
+                    else:
+                        # In active_file_map but genuinely expired (now > expires)
+                        main.active_file_map.pop(file_id, None)
+                        if rec.get("filepath"):
+                            main.cleanup_file(rec["filepath"], trigger="status_check_expired", job_id=job_id, file_id=file_id)
 
         if not is_valid:
             # Asset is expired or missing; transition atomically from ready to asset_expired

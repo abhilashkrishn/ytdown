@@ -20,9 +20,11 @@ import diagnostic_timing
 import diagnostic_logger
 import job_manager
 import traceback
+import subprocess
+import errno
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse, parse_qs, quote
-from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends
+from fastapi import FastAPI, HTTPException, Request, Depends
 from fastapi.responses import FileResponse, StreamingResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
@@ -188,6 +190,7 @@ DISCONNECT_CLEANUP_GRACE_SECONDS = 60
 X_ACCEL_QUIET_PERIOD_SECONDS = 5
 NGINX_MAX_DELIVERY_RECOVERY_SECONDS = 1800  # Conservative 30-min window for safe recovery of lost datagrams
 TMPFS_THRESHOLD_BYTES = 200 * 1024 * 1024  # 200 MB
+VALID_VIDEO_EXTENSIONS = {".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi"}
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 frontend_dir = os.path.join(current_dir, "frontend")
@@ -203,6 +206,7 @@ state_lock = asyncio.Lock()
 extraction_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTIONS)
 
 
+### --- SECTION 4: STORAGE TIERING & NGINX TIMEOUT HANDLING --- ###
 async def migrate_tmpfs_to_disk(file_id: str, rec: dict) -> bool:
     """
     Migrates a file from tmpfs (TMPFS_DOWNLOAD_DIR) to persistent storage (TEMP_DOWNLOAD_DIR).
@@ -309,7 +313,7 @@ async def expire_stale_nginx_request(file_id: str, request_id: str, trigger: str
                 await migrate_tmpfs_to_disk(file_id, rec)
 
 
-### --- SECTION 4: MAINTENANCE TASKS --- ###
+### --- SECTION 5: PERIODIC MAINTENANCE TASKS --- ###
 async def run_maintenance_tasks():
     now = time.time()
     files_to_clean = []
@@ -442,7 +446,7 @@ async def run_maintenance_tasks():
 
     # Prune expired mobile jobs
     try:
-        job_manager.delete_expired_jobs()
+        await asyncio.to_thread(job_manager.delete_expired_jobs)
     except Exception as jm_err:
         print(f"Warning: Error pruning expired mobile jobs: {jm_err}")
 
@@ -456,7 +460,7 @@ async def periodic_maintenance_loop():
         pass
 
 
-### --- SECTION 5: SECURITY & VALIDATION HELPERS --- ###
+### --- SECTION 6: AUTHENTICATION, CSRF & SECURITY VALIDATION --- ###
 async def validate_url_safety(url_str: str):
     """
     Validates URL syntax and performs an initial DNS resolution check.
@@ -607,16 +611,100 @@ class DownloadCancelled(Exception):
     pass
 
 
+### --- SECTION 7: RUNTIME HARDENING & YOUTUBEDL WRAPPER --- ###
+_thread_local = threading.local()
+
+def _is_safe_ip(ip_str: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(ip_str)
+        return getattr(ip, "is_global", False) and not (
+            ip.is_private or ip.is_loopback or ip.is_link_local or ip.is_multicast or ip.is_reserved or ip.is_unspecified
+        )
+    except ValueError:
+        return False
+
+_orig_socket_connect = socket.socket.connect
+_orig_socket_connect_ex = socket.socket.connect_ex
+
+def _safe_socket_connect(self, address):
+    if getattr(_thread_local, "enforce_ssrf_protection", False):
+        if isinstance(address, tuple) and len(address) >= 2 and isinstance(address[0], str):
+            ip_str = address[0]
+            if not _is_safe_ip(ip_str):
+                raise PermissionError(f"SSRF blocked: connection to non-global destination '{ip_str}' denied")
+    return _orig_socket_connect(self, address)
+
+def _safe_socket_connect_ex(self, address):
+    if getattr(_thread_local, "enforce_ssrf_protection", False):
+        if isinstance(address, tuple) and len(address) >= 2 and isinstance(address[0], str):
+            ip_str = address[0]
+            if not _is_safe_ip(ip_str):
+                return errno.EPERM
+    return _orig_socket_connect_ex(self, address)
+
+socket.socket.connect = _safe_socket_connect
+socket.socket.connect_ex = _safe_socket_connect_ex
+
+
+class SubprocessTracker:
+    def __init__(self):
+        self.procs = set()
+        self.lock = threading.Lock()
+        self.cancelled = False
+
+    def add(self, p):
+        with self.lock:
+            if self.cancelled:
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+                return
+            self.procs.add(p)
+
+    def discard(self, p):
+        with self.lock:
+            self.procs.discard(p)
+
+    def terminate_all(self):
+        with self.lock:
+            self.cancelled = True
+            for p in list(self.procs):
+                try:
+                    p.kill()
+                except OSError:
+                    pass
+            self.procs.clear()
+
+_orig_popen_init = subprocess.Popen.__init__
+
+def _tracking_popen_init(self, *args, **kwargs):
+    _orig_popen_init(self, *args, **kwargs)
+    tracker = getattr(_thread_local, "subprocess_tracker", None)
+    if tracker is not None:
+        tracker.add(self)
+
+subprocess.Popen.__init__ = _tracking_popen_init
+
+
 class ReadOnlyYoutubeDL(yt_dlp.YoutubeDL):
     """
-    Custom YoutubeDL wrapper that suppresses automatic cookie-jar serialization to disk.
-    Treats cookies.txt as a strictly read-only credential source.
+    Custom YoutubeDL wrapper that:
+    1. Suppresses automatic cookie-jar serialization to disk (cookies.txt remains strictly read-only).
+    2. Enforces socket-level SSRF and DNS-rebinding protection during all extraction and download network activity.
     """
     def save_cookies(self):
         pass
 
+    def __enter__(self):
+        _thread_local.enforce_ssrf_protection = True
+        return super().__enter__()
 
-### --- SECTION 6: UTILITY FUNCTIONS & APP INIT --- ###
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        _thread_local.enforce_ssrf_protection = False
+        return super().__exit__(exc_type, exc_val, exc_tb)
+
+
 def cleanup_file(filepath: str, trigger: typing.Optional[str] = None, job_id: typing.Optional[str] = None, file_id: typing.Optional[str] = None):
     if not filepath:
         return
@@ -761,6 +849,8 @@ def is_fully_covered(delivered_ranges: list, total_size: int) -> bool:
         return delivered_ranges[0][0] == 0 and delivered_ranges[0][1] >= total_size
     return False
 
+### --- SECTION 8: NGINX PROTOCOL & APPLICATION LIFESPAN --- ###
+### --- 8.1: NGINX LOG DATAGRAM LISTENER --- ###
 class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
     def __init__(self):
         super().__init__()
@@ -1016,6 +1106,7 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
                     if rec.get("storage_type") == "tmpfs":
                         await migrate_tmpfs_to_disk(file_id, rec)
 
+### --- 8.2: STREAMING RESPONSE WRAPPER --- ###
 class ResilientFileResponse(FileResponse):
     def __init__(self, *args, on_completed=None, on_disconnected=None, **kwargs):
         super().__init__(*args, **kwargs)
@@ -1046,6 +1137,7 @@ class ResilientFileResponse(FileResponse):
                         # Shield callback execution against cancellation to guarantee active_streams decrement
                         await asyncio.shield(res)
 
+### --- 8.3: APPLICATION STARTUP & LIFESPAN MANAGEMENT --- ###
 def remove_path_force(target_path: str):
     """
     Deletes a file, symlink, or directory tree during startup cleanup.
@@ -1199,12 +1291,10 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="StreamVault Premium Platform Downloader", lifespan=lifespan)
 import mobile_api
 app.include_router(mobile_api.router)
-current_dir = os.path.dirname(os.path.abspath(__file__))
-frontend_dir = os.path.join(current_dir, "frontend")
 app.mount("/static", StaticFiles(directory=frontend_dir), name="static")
 
 
-### --- SECTION 7: UI & AUTH ROUTES --- ###
+### --- SECTION 9: UI & AUTHENTICATION ROUTES --- ###
 @app.get("/")
 async def get_ui(request: Request):
     try:
@@ -1277,7 +1367,7 @@ async def logout(request: Request):
     response.delete_cookie(key="streamvault_session", httponly=True, secure=COOKIE_SECURE, samesite="strict")
     return response
 
-### --- SECTION 8: METADATA ROUTE --- ###
+### --- SECTION 10: METADATA EXTRACTION ROUTE --- ###
 @app.get("/api/options", dependencies=[Depends(verify_session)])
 async def get_options(url: str):
     try:
@@ -1368,7 +1458,8 @@ async def get_options(url: str):
         extraction_semaphore.release()
 
 
-### --- SECTION 9.1: CORE DOWNLOAD ENGINE --- ###
+### --- SECTION 11: CORE DOWNLOAD ENGINE --- ###
+### --- 11.1: DOWNLOAD REGISTRATION & PROGRESS MONITORING --- ###
 async def execute_download_core(
     file_uuid: str,
     url: str,
@@ -1482,7 +1573,11 @@ async def execute_download_core(
     if os.path.exists(cookie_path):
         ydl_opts['cookiefile'] = cookie_path
 
+    subproc_tracker = SubprocessTracker()
+
+    ### --- 11.2: SYNCHRONOUS WORKER & YT-DLP EXECUTION --- ###
     def run_native_download():
+        _thread_local.subprocess_tracker = subproc_tracker
         try:
             diagnostic_timing.tracker.record_extraction_start(job_id)
             if diagnostic_logger.is_enabled():
@@ -1512,8 +1607,10 @@ async def execute_download_core(
                 )
             return "DONE", None
         except DownloadCancelled:
+            subproc_tracker.terminate_all()
             return "CANCELLED", None
         except Exception as e:
+            subproc_tracker.terminate_all()
             err_text = clean_terminal_ansi(str(e))
             print(f"Download processing error for {url}: {err_text}")
             if diagnostic_logger.is_enabled():
@@ -1524,6 +1621,9 @@ async def execute_download_core(
                     details={"error": err_text, "traceback": traceback.format_exc()}
                 )
             return "ERROR", f"Failed to retrieve video metadata or download stream: {err_text}"
+        finally:
+            subproc_tracker.terminate_all()
+            _thread_local.subprocess_tracker = None
 
     worker_task = main_loop.run_in_executor(None, run_native_download)
     async with state_lock:
@@ -1543,6 +1643,7 @@ async def execute_download_core(
             outcome, err_msg = "CANCELLED", "Download Cancelled."
             raise
 
+        ### --- 11.3: STORAGE TIERING & POST-DOWNLOAD COMPLETION --- ###
         if outcome == "DONE":
             downloaded_file = None
             for file in os.listdir(TEMP_DOWNLOAD_DIR):
@@ -1552,7 +1653,7 @@ async def execute_download_core(
 
             if downloaded_file and os.path.exists(downloaded_file):
                 raw_ext = os.path.splitext(downloaded_file)[1].lower()
-                if raw_ext not in {".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi"}:
+                if raw_ext not in VALID_VIDEO_EXTENSIONS:
                     normalized_path = os.path.join(TEMP_DOWNLOAD_DIR, f"{file_uuid}.mp4")
                     try:
                         os.replace(downloaded_file, normalized_path)
@@ -1676,6 +1777,7 @@ async def execute_download_core(
         worker_finished = False
         try:
             cancel_event.set()
+            subproc_tracker.terminate_all()
             try:
                 if worker_task and not worker_task.done():
                     await asyncio.wait_for(asyncio.shield(worker_task), timeout=15.0)
@@ -1733,7 +1835,7 @@ async def execute_download_core(
             pass
 
 
-### --- SECTION 9.2: DOWNLOAD PROGRESS ROUTE (SSE ADAPTER) --- ###
+### --- SECTION 12: DOWNLOAD PROGRESS ROUTE (SSE ADAPTER) --- ###
 @app.get("/api/download-progress", dependencies=[Depends(verify_session)])
 async def download_progress(request: Request, url: str, format_id: str):
     try:
@@ -1831,7 +1933,7 @@ async def download_progress(request: Request, url: str, format_id: str):
 
     return StreamingResponse(sse_event_generator(), media_type="text/event-stream")
 
-### --- SECTION 10: CANCELLATION & FILE RETRIEVAL ROUTES --- ###
+### --- SECTION 13: CANCELLATION & FILE RETRIEVAL ROUTES --- ###
 @app.post("/api/cancel", dependencies=[Depends(verify_csrf), Depends(verify_session)])
 async def cancel_download(file_id: str):
     validate_uuid(file_id)
@@ -1879,222 +1981,237 @@ async def deliver_file_response(request: Request, file_id: str, title: str, job_
             job_manager.expire_job_asset(job_id=resolved_job_id, file_id=file_id)
             raise HTTPException(status_code=404, detail="Asset no longer exists on disk.")
 
-    safe_name = sanitize_filename(title).strip().rstrip(". ")
+    # Flag indicating whether cleanup responsibility has been transferred to response callbacks / Nginx registration
+    cleanup_registered = False
 
-    VALID_VIDEO_EXTENSIONS = {".mp4", ".webm", ".mkv", ".mov", ".m4v", ".avi"}
-    raw_ext = os.path.splitext(filepath)[1].lower()
-    ext = raw_ext if raw_ext in VALID_VIDEO_EXTENSIONS else ".mp4"
+    try:
+        safe_name = sanitize_filename(title).strip().rstrip(". ")
 
-    if safe_name.lower().endswith(ext.lower()):
-        safe_name = safe_name[:-len(ext)].rstrip(". ")
+        raw_ext = os.path.splitext(filepath)[1].lower()
+        ext = raw_ext if raw_ext in VALID_VIDEO_EXTENSIONS else ".mp4"
 
-    # Bound HTTP download filename length to prevent oversized headers (e.g. Nginx 502 upstream header overflow)
-    # Long Unicode/Malayalam titles can expand dramatically when percent-encoded (up to 9x bytes).
-    MAX_DOWNLOAD_NAME_LENGTH = 80
-    if len(safe_name) > MAX_DOWNLOAD_NAME_LENGTH:
-        safe_name = safe_name[:MAX_DOWNLOAD_NAME_LENGTH]
-        while safe_name and (unicodedata.combining(safe_name[-1]) or safe_name[-1] in ". "):
-            safe_name = safe_name[:-1]
+        if safe_name.lower().endswith(ext.lower()):
+            safe_name = safe_name[:-len(ext)].rstrip(". ")
 
-    if not safe_name:
-        safe_name = "StreamVault_Download"
+        # Bound HTTP download filename length to prevent oversized headers (e.g. Nginx 502 upstream header overflow)
+        # Long Unicode/Malayalam titles can expand dramatically when percent-encoded (up to 9x bytes).
+        MAX_DOWNLOAD_NAME_LENGTH = 80
+        if len(safe_name) > MAX_DOWNLOAD_NAME_LENGTH:
+            safe_name = safe_name[:MAX_DOWNLOAD_NAME_LENGTH]
+            while safe_name and (unicodedata.combining(safe_name[-1]) or safe_name[-1] in ". "):
+                safe_name = safe_name[:-1]
 
-    guessed_type, _ = mimetypes.guess_type(f"video{ext}")
-    media_type = guessed_type or ("video/mp4" if ext == ".mp4" else "application/octet-stream")
-    encoded_filename = quote(f"{safe_name}{ext}")
-    ascii_safe_name = re.sub(r'\s+', ' ', re.sub(r'[^\x20-\x7E]', ' ', safe_name).replace('"', '')).strip(". ")
-    if len(ascii_safe_name) > MAX_DOWNLOAD_NAME_LENGTH:
-        ascii_safe_name = ascii_safe_name[:MAX_DOWNLOAD_NAME_LENGTH].strip(". ")
-    if not ascii_safe_name:
-        ascii_safe_name = "StreamVault_Download"
+        if not safe_name:
+            safe_name = "StreamVault_Download"
 
-    content_disposition = f'attachment; filename="{ascii_safe_name}{ext}"; filename*=UTF-8\'\'{encoded_filename}'
+        guessed_type, _ = mimetypes.guess_type(f"video{ext}")
+        media_type = guessed_type or ("video/mp4" if ext == ".mp4" else "application/octet-stream")
+        encoded_filename = quote(f"{safe_name}{ext}")
+        ascii_safe_name = re.sub(r'\s+', ' ', re.sub(r'[^\x20-\x7E]', ' ', safe_name).replace('"', '')).strip(". ")
+        if len(ascii_safe_name) > MAX_DOWNLOAD_NAME_LENGTH:
+            ascii_safe_name = ascii_safe_name[:MAX_DOWNLOAD_NAME_LENGTH].strip(". ")
+        if not ascii_safe_name:
+            ascii_safe_name = "StreamVault_Download"
 
-    range_header = request.headers.get("range", "").strip() if request.headers else ""
-    is_range_request = bool(range_header)
-    range_bounds = None
-    if is_range_request and range_header.startswith("bytes="):
-        parts = range_header[6:].split("-")
-        if len(parts) == 2:
-            try:
-                r_start = int(parts[0]) if parts[0] else 0
-                r_end = int(parts[1]) if parts[1] else (file_size - 1)
-                r_end = min(r_end, file_size - 1)
-                if 0 <= r_start <= r_end < file_size:
-                    range_bounds = (r_start, r_end + 1)
-            except ValueError:
-                range_bounds = None
+        content_disposition = f'attachment; filename="{ascii_safe_name}{ext}"; filename*=UTF-8\'\'{encoded_filename}'
 
-    if diagnostic_logger.is_enabled():
-        diagnostic_logger.log_event(
-            "delivery_request_received",
-            job_id=resolved_job_id,
-            file_id=file_id,
-            details={
-                "delivery_mode": "nginx_xaccel" if USE_X_ACCEL_REDIRECT else "python_stream",
-                "range_header": range_header,
-                "is_range_request": is_range_request,
-                "range_bounds": range_bounds,
-                "file_size": file_size,
-                "storage_type": storage_type
-            }
-        )
-
-    def schedule_inactivity_cleanup(rec):
-        """Helper to schedule a safe 60s delayed cleanup verifying record identity."""
-        if diagnostic_logger.is_enabled():
-            diagnostic_logger.log_event(
-                "inactivity_cleanup_scheduled",
-                job_id=rec.get("job_id"),
-                file_id=file_id,
-                details={"grace_seconds": DISCONNECT_CLEANUP_GRACE_SECONDS}
-            )
-        async def delayed_disconnect_cleanup():
-            try:
-                await asyncio.sleep(DISCONNECT_CLEANUP_GRACE_SECONDS)
-                async with state_lock:
-                    current_rec = active_file_map.get(file_id)
-                    # Verify record identity and that zero streams are active
-                    if current_rec is rec and current_rec.get("active_streams", 0) == 0:
-                        current_filepath = current_rec.get("filepath") or filepath
-                        active_file_map.pop(file_id, None)
-                        if pending_disconnect_cleanups.get(file_id) is this_task:
-                            pending_disconnect_cleanups.pop(file_id, None)
-                        cleanup_file(current_filepath, trigger="inactivity_grace_elapsed", job_id=current_rec.get("job_id"), file_id=file_id)
-                        if current_filepath != filepath and os.path.exists(filepath):
-                            cleanup_file(filepath, trigger="inactivity_grace_elapsed_original")
-            except asyncio.CancelledError:
-                pass
-            finally:
-                async with state_lock:
-                    if pending_disconnect_cleanups.get(file_id) is this_task:
-                        pending_disconnect_cleanups.pop(file_id, None)
-
-        existing_timer = pending_disconnect_cleanups.pop(file_id, None)
-        if existing_timer:
-            existing_timer.cancel()
-        this_task = asyncio.create_task(delayed_disconnect_cleanup())
-        pending_disconnect_cleanups[file_id] = this_task
-
-    async def on_stream_end(was_full_success: bool):
-        async with state_lock:
-            rec = active_file_map.get(file_id)
-            if not rec or id(rec) != record_id:
-                return
-            rec["active_streams"] = max(0, rec.get("active_streams", 1) - 1)
-            remaining_streams = rec["active_streams"]
-
-            # If the response completed successfully, record delivered byte range
-            if was_full_success:
-                if is_range_request and range_bounds:
-                    rec["delivered_ranges"] = add_delivered_range(
-                        rec.get("delivered_ranges", []),
-                        range_bounds[0],
-                        range_bounds[1]
-                    )
-                elif not is_range_request and file_size > 0:
-                    rec["delivered_ranges"] = add_delivered_range(
-                        rec.get("delivered_ranges", []),
-                        0,
-                        file_size
-                    )
-
-            fully_covered = is_fully_covered(rec.get("delivered_ranges", []), file_size)
-
-            if diagnostic_logger.is_enabled():
-                diagnostic_logger.log_event(
-                    "stream_ended" if was_full_success else "stream_interrupted",
-                    job_id=rec.get("job_id") or resolved_job_id,
-                    file_id=file_id,
-                    details={
-                        "was_full_success": was_full_success,
-                        "is_range_request": is_range_request,
-                        "range_bounds": range_bounds,
-                        "remaining_streams": remaining_streams,
-                        "delivered_ranges": rec.get("delivered_ranges", []),
-                        "fully_covered": fully_covered
-                    }
-                )
-
-            # If full byte coverage is achieved, update mobile job status to completed idempotently
-            if fully_covered:
-                jid = rec.get("job_id")
-                if jid:
-                    try:
-                        job_manager.update_job(jid, status="completed")
-                    except Exception as jm_err:
-                        print(f"Warning: Failed to update job {jid} to completed: {jm_err}")
-                    diagnostic_timing.tracker.record_delivery_end(jid, bytes_delivered=file_size)
-
-            # Immediate cleanup only when fully covered and no other streams are active
-            if fully_covered and remaining_streams == 0:
-                current_filepath = rec.get("filepath") or filepath
-                active_file_map.pop(file_id, None)
-                timer = pending_disconnect_cleanups.pop(file_id, None)
-                if timer:
-                    timer.cancel()
-                cleanup_file(current_filepath, trigger="delivery_fully_covered", job_id=rec.get("job_id"), file_id=file_id)
-                if current_filepath != filepath and os.path.exists(filepath):
-                    cleanup_file(filepath, trigger="delivery_fully_covered_original")
-                return
-
-            # For Range requests, disconnects, or partial streams with 0 active streams, start 60s grace timer
-            if remaining_streams == 0:
-                if rec.get("storage_type") == "tmpfs":
-                    await migrate_tmpfs_to_disk(file_id, rec)
-                schedule_inactivity_cleanup(rec)
-
-    # Mode 1: Nginx X-Accel-Redirect delivery
-    if USE_X_ACCEL_REDIRECT:
-        filename_only = os.path.basename(filepath)
-        internal_base = f"/internal_tmpfs/{filename_only}" if storage_type == "tmpfs" else f"/internal_downloads/{filename_only}"
-
-        request_id = str(uuid.uuid4())
-        async with state_lock:
-            # Register unique request ID before returning X-Accel-Redirect
-            rec = active_file_map.get(file_id)
-            if rec:
-                pending_set = rec.setdefault("pending_requests", set())
-                pending_set.add(request_id)
-                rec.setdefault("pending_request_times", {})[request_id] = time.time()
-                print(f"[NGINX_LOG] Request registered: file_id={file_id}, request_id={request_id} (pending: {len(pending_set)})")
-
-        internal_uri = f"{internal_base}?sv_fid={file_id}&sv_rid={request_id}"
+        range_header = request.headers.get("range", "").strip() if request.headers else ""
+        is_range_request = bool(range_header)
+        range_bounds = None
+        if is_range_request and range_header.startswith("bytes="):
+            parts = range_header[6:].split("-")
+            if len(parts) == 2:
+                try:
+                    r_start = int(parts[0]) if parts[0] else 0
+                    r_end = int(parts[1]) if parts[1] else (file_size - 1)
+                    r_end = min(r_end, file_size - 1)
+                    if 0 <= r_start <= r_end < file_size:
+                        range_bounds = (r_start, r_end + 1)
+                except ValueError:
+                    range_bounds = None
 
         if diagnostic_logger.is_enabled():
             diagnostic_logger.log_event(
-                "nginx_xaccel_registered",
+                "delivery_request_received",
                 job_id=resolved_job_id,
                 file_id=file_id,
                 details={
-                    "request_id": request_id,
-                    "internal_uri": internal_uri,
-                    "pending_requests_count": len(pending_set) if rec else 0
+                    "delivery_mode": "nginx_xaccel" if USE_X_ACCEL_REDIRECT else "python_stream",
+                    "range_header": range_header,
+                    "is_range_request": is_range_request,
+                    "range_bounds": range_bounds,
+                    "file_size": file_size,
+                    "storage_type": storage_type
                 }
             )
 
+        def schedule_inactivity_cleanup(rec):
+            """Helper to schedule a safe 60s delayed cleanup verifying record identity."""
+            if diagnostic_logger.is_enabled():
+                diagnostic_logger.log_event(
+                    "inactivity_cleanup_scheduled",
+                    job_id=rec.get("job_id"),
+                    file_id=file_id,
+                    details={"grace_seconds": DISCONNECT_CLEANUP_GRACE_SECONDS}
+                )
+            async def delayed_disconnect_cleanup():
+                try:
+                    await asyncio.sleep(DISCONNECT_CLEANUP_GRACE_SECONDS)
+                    async with state_lock:
+                        current_rec = active_file_map.get(file_id)
+                        # Verify record identity and that zero streams are active
+                        if current_rec is rec and current_rec.get("active_streams", 0) == 0:
+                            current_filepath = current_rec.get("filepath") or filepath
+                            active_file_map.pop(file_id, None)
+                            if pending_disconnect_cleanups.get(file_id) is this_task:
+                                pending_disconnect_cleanups.pop(file_id, None)
+                            cleanup_file(current_filepath, trigger="inactivity_grace_elapsed", job_id=current_rec.get("job_id"), file_id=file_id)
+                            if current_filepath != filepath and os.path.exists(filepath):
+                                cleanup_file(filepath, trigger="inactivity_grace_elapsed_original")
+                except asyncio.CancelledError:
+                    pass
+                finally:
+                    async with state_lock:
+                        if pending_disconnect_cleanups.get(file_id) is this_task:
+                            pending_disconnect_cleanups.pop(file_id, None)
+
+            existing_timer = pending_disconnect_cleanups.pop(file_id, None)
+            if existing_timer:
+                existing_timer.cancel()
+            this_task = asyncio.create_task(delayed_disconnect_cleanup())
+            pending_disconnect_cleanups[file_id] = this_task
+
+        async def on_stream_end(was_full_success: bool):
+            async with state_lock:
+                rec = active_file_map.get(file_id)
+                if not rec or id(rec) != record_id:
+                    return
+                rec["active_streams"] = max(0, rec.get("active_streams", 1) - 1)
+                remaining_streams = rec["active_streams"]
+
+                # If the response completed successfully, record delivered byte range
+                if was_full_success:
+                    if is_range_request and range_bounds:
+                        rec["delivered_ranges"] = add_delivered_range(
+                            rec.get("delivered_ranges", []),
+                            range_bounds[0],
+                            range_bounds[1]
+                        )
+                    elif not is_range_request and file_size > 0:
+                        rec["delivered_ranges"] = add_delivered_range(
+                            rec.get("delivered_ranges", []),
+                            0,
+                            file_size
+                        )
+
+                fully_covered = is_fully_covered(rec.get("delivered_ranges", []), file_size)
+
+                if diagnostic_logger.is_enabled():
+                    diagnostic_logger.log_event(
+                        "stream_ended" if was_full_success else "stream_interrupted",
+                        job_id=rec.get("job_id") or resolved_job_id,
+                        file_id=file_id,
+                        details={
+                            "was_full_success": was_full_success,
+                            "is_range_request": is_range_request,
+                            "range_bounds": range_bounds,
+                            "remaining_streams": remaining_streams,
+                            "delivered_ranges": rec.get("delivered_ranges", []),
+                            "fully_covered": fully_covered
+                        }
+                    )
+
+                # If full byte coverage is achieved, update mobile job status to completed idempotently
+                if fully_covered:
+                    jid = rec.get("job_id")
+                    if jid:
+                        try:
+                            job_manager.update_job(jid, status="completed")
+                        except Exception as jm_err:
+                            print(f"Warning: Failed to update job {jid} to completed: {jm_err}")
+                        diagnostic_timing.tracker.record_delivery_end(jid, bytes_delivered=file_size)
+
+                # Immediate cleanup only when fully covered and no other streams are active
+                if fully_covered and remaining_streams == 0:
+                    current_filepath = rec.get("filepath") or filepath
+                    active_file_map.pop(file_id, None)
+                    timer = pending_disconnect_cleanups.pop(file_id, None)
+                    if timer:
+                        timer.cancel()
+                    cleanup_file(current_filepath, trigger="delivery_fully_covered", job_id=rec.get("job_id"), file_id=file_id)
+                    if current_filepath != filepath and os.path.exists(filepath):
+                        cleanup_file(filepath, trigger="delivery_fully_covered_original")
+                    return
+
+                # For Range requests, disconnects, or partial streams with 0 active streams, start 60s grace timer
+                if remaining_streams == 0:
+                    if rec.get("storage_type") == "tmpfs":
+                        await migrate_tmpfs_to_disk(file_id, rec)
+                    schedule_inactivity_cleanup(rec)
+
+        # Mode 1: Nginx X-Accel-Redirect delivery
+        if USE_X_ACCEL_REDIRECT:
+            filename_only = os.path.basename(filepath)
+            internal_base = f"/internal_tmpfs/{filename_only}" if storage_type == "tmpfs" else f"/internal_downloads/{filename_only}"
+
+            request_id = str(uuid.uuid4())
+            async with state_lock:
+                # Register unique request ID before returning X-Accel-Redirect
+                rec = active_file_map.get(file_id)
+                if rec:
+                    pending_set = rec.setdefault("pending_requests", set())
+                    pending_set.add(request_id)
+                    rec.setdefault("pending_request_times", {})[request_id] = time.time()
+                    print(f"[NGINX_LOG] Request registered: file_id={file_id}, request_id={request_id} (pending: {len(pending_set)})")
+
+            # Ownership of decrement handed over to Nginx log listener socket / stale request expiry
+            cleanup_registered = True
+
+            internal_uri = f"{internal_base}?sv_fid={file_id}&sv_rid={request_id}"
+
+            if diagnostic_logger.is_enabled():
+                diagnostic_logger.log_event(
+                    "nginx_xaccel_registered",
+                    job_id=resolved_job_id,
+                    file_id=file_id,
+                    details={
+                        "request_id": request_id,
+                        "internal_uri": internal_uri,
+                        "pending_requests_count": len(pending_set) if rec else 0
+                    }
+                )
+
+            headers = {
+                "X-Accel-Redirect": internal_uri,
+                "Content-Type": media_type,
+                "Content-Disposition": content_disposition,
+                "Accept-Ranges": "bytes"
+            }
+            return Response(status_code=200, headers=headers)
+
+        # Mode 2: Hybrid Python ResilientFileResponse delivery with Range & 60s disconnect handling
         headers = {
-            "X-Accel-Redirect": internal_uri,
-            "Content-Type": media_type,
             "Content-Disposition": content_disposition,
             "Accept-Ranges": "bytes"
         }
-        return Response(status_code=200, headers=headers)
-
-    # Mode 2: Hybrid Python ResilientFileResponse delivery with Range & 60s disconnect handling
-    headers = {
-        "Content-Disposition": content_disposition,
-        "Accept-Ranges": "bytes"
-    }
-    return ResilientFileResponse(
-        path=filepath,
-        media_type=media_type,
-        headers=headers,
-        filename=f"{safe_name}{ext}",
-        status_code=206 if is_range_request else 200,
-        on_completed=lambda: on_stream_end(was_full_success=(not is_range_request or range_bounds is not None)),
-        on_disconnected=lambda: on_stream_end(was_full_success=False)
-    )
+        response = ResilientFileResponse(
+            path=filepath,
+            media_type=media_type,
+            headers=headers,
+            filename=f"{safe_name}{ext}",
+            status_code=206 if is_range_request else 200,
+            on_completed=lambda: on_stream_end(was_full_success=(not is_range_request or range_bounds is not None)),
+            on_disconnected=lambda: on_stream_end(was_full_success=False)
+        )
+        cleanup_registered = True
+        return response
+    except Exception:
+        if not cleanup_registered:
+            async with state_lock:
+                rec = active_file_map.get(file_id)
+                if rec and id(rec) == record_id:
+                    rec["active_streams"] = max(0, rec.get("active_streams", 1) - 1)
+        raise
 
 @app.get("/api/get-file", dependencies=[Depends(verify_session)])
 async def get_file(request: Request, file_id: str, title: str):
