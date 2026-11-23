@@ -1,5 +1,7 @@
 ### --- SECTION 1: IMPORTS & ENVIRONMENT SETUP --- ###
 import os
+import sys
+import stat
 import uuid
 import yt_dlp
 import re
@@ -184,11 +186,128 @@ MAX_CONCURRENT_EXTRACTIONS = 5
 UNCLAIMED_FILE_EXPIRY = 3600
 DISCONNECT_CLEANUP_GRACE_SECONDS = 60
 X_ACCEL_QUIET_PERIOD_SECONDS = 5
+NGINX_MAX_DELIVERY_RECOVERY_SECONDS = 1800  # Conservative 30-min window for safe recovery of lost datagrams
 TMPFS_THRESHOLD_BYTES = 200 * 1024 * 1024  # 200 MB
+
+current_dir = os.path.dirname(os.path.abspath(__file__))
+frontend_dir = os.path.join(current_dir, "frontend")
+TEMP_DOWNLOAD_DIR = os.path.join(current_dir, "temp_downloads")
+TMPFS_DOWNLOAD_DIR = os.path.join(current_dir, "temp_downloads_tmpfs")
+RUN_DIR = os.path.join(current_dir, "run")
+os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(TMPFS_DOWNLOAD_DIR, exist_ok=True)
+os.makedirs(RUN_DIR, exist_ok=True)
 
 # Concurrency synchronization primitives (single-process asyncio event loop)
 state_lock = asyncio.Lock()
 extraction_semaphore = asyncio.Semaphore(MAX_CONCURRENT_EXTRACTIONS)
+
+
+async def migrate_tmpfs_to_disk(file_id: str, rec: dict) -> bool:
+    """
+    Migrates a file from tmpfs (TMPFS_DOWNLOAD_DIR) to persistent storage (TEMP_DOWNLOAD_DIR).
+    Requirements:
+    - Never migrate while another legitimate delivery is active.
+    - Update active_file_map path and storage_type consistently after migration.
+    """
+    if rec.get("storage_type") != "tmpfs":
+        return False
+
+    if len(rec.get("pending_requests", set())) > 0 or rec.get("active_streams", 0) > 0:
+        return False
+
+    if rec.get("is_migrating"):
+        return False
+    rec["is_migrating"] = True
+
+    src_path = rec.get("filepath")
+    if not src_path or not os.path.exists(src_path):
+        rec["is_migrating"] = False
+        return False
+
+    filename = os.path.basename(src_path)
+    dest_path = os.path.join(TEMP_DOWNLOAD_DIR, filename)
+
+    if os.path.abspath(src_path) == os.path.abspath(dest_path):
+        rec["storage_type"] = "disk"
+        rec["is_migrating"] = False
+        return False
+
+    try:
+        loop = asyncio.get_running_loop()
+
+        def _move():
+            if os.path.exists(dest_path) and os.path.abspath(dest_path) != os.path.abspath(src_path):
+                try:
+                    os.remove(dest_path)
+                except Exception:
+                    pass
+            shutil.move(src_path, dest_path)
+
+        await loop.run_in_executor(None, _move)
+
+        rec["filepath"] = dest_path
+        rec["storage_type"] = "disk"
+        print(f"[STORAGE_TIER] Migrated {file_id} from tmpfs to disk: {dest_path}")
+        if diagnostic_logger.is_enabled():
+            diagnostic_logger.log_event(
+                "storage_tier_migrated",
+                job_id=rec.get("job_id"),
+                file_id=file_id,
+                details={
+                    "from_storage": "tmpfs",
+                    "to_storage": "disk",
+                    "filepath": dest_path
+                }
+            )
+        return True
+    except Exception as e:
+        print(f"[STORAGE_TIER] Warning: Failed to migrate {file_id} to disk: {e}")
+        return False
+    finally:
+        rec.pop("is_migrating", None)
+
+
+async def expire_stale_nginx_request(file_id: str, request_id: str, trigger: str = "recovery"):
+    """
+    Safely expires an unacknowledged Nginx request only when transfer termination
+    has been reliably established (e.g. after conservative maximum delivery window).
+    Updates active_streams and pending_requests counters exactly once, and migrates
+    from tmpfs to persistent storage once no legitimate delivery remains active.
+    """
+    async with state_lock:
+        rec = active_file_map.get(file_id)
+        if not rec:
+            return
+        pending_set = rec.get("pending_requests", set())
+        if request_id not in pending_set:
+            return
+
+        pending_set.discard(request_id)
+        rec.get("pending_request_times", {}).pop(request_id, None)
+
+        rec["active_streams"] = max(0, rec.get("active_streams", 1) - 1)
+        remaining_requests = len(pending_set)
+        active_streams = rec.get("active_streams", 0)
+
+        print(f"[NGINX_LOG] Stale request safely expired ({trigger}): file_id={file_id}, request_id={request_id} (remaining pending: {remaining_requests}, active_streams: {active_streams})")
+        if diagnostic_logger.is_enabled():
+            diagnostic_logger.log_event(
+                "nginx_request_timeout",
+                job_id=rec.get("job_id"),
+                file_id=file_id,
+                details={
+                    "request_id": request_id,
+                    "trigger": trigger,
+                    "remaining_pending": remaining_requests,
+                    "active_streams": active_streams
+                }
+            )
+
+        if remaining_requests == 0 and active_streams == 0:
+            if rec.get("storage_type") == "tmpfs":
+                await migrate_tmpfs_to_disk(file_id, rec)
+
 
 ### --- SECTION 4: MAINTENANCE TASKS --- ###
 async def run_maintenance_tasks():
@@ -206,7 +325,33 @@ async def run_maintenance_tasks():
             pending_requests = len(rec.get("pending_requests", set()))
             is_expired = now > rec.get("expires", 0)
             fpath = rec.get("filepath")
+            file_size = rec.get("size", 0)
             is_missing = not fpath or not os.path.exists(fpath)
+
+            # Safe recovery for unacknowledged Nginx requests only when transfer termination
+            # can be established reliably:
+            # 1. Conservative maximum delivery duration based on file size (~50 KB/s minimum speed)
+            # 2. Or when the asset has reached full expiration (is_expired)
+            req_times = rec.get("pending_request_times", {})
+            max_safe_duration = max(NGINX_MAX_DELIVERY_RECOVERY_SECONDS, int(file_size / (50 * 1024)))
+            stale_rids = [
+                rid for rid, t in list(req_times.items())
+                if is_expired or (now - t) >= max_safe_duration
+            ]
+            for srid in stale_rids:
+                rec.get("pending_requests", set()).discard(srid)
+                req_times.pop(srid, None)
+                rec["active_streams"] = max(0, rec.get("active_streams", 1) - 1)
+                print(f"[MAINTENANCE] Safely recovered unacknowledged request {srid} for {fid}")
+
+            active_streams = rec.get("active_streams", 0)
+            pending_requests = len(rec.get("pending_requests", set()))
+
+            # Tmpfs lifecycle management: if no delivery is active, migrate to persistent storage
+            # instead of retaining in tmpfs for 3600 seconds
+            if rec.get("storage_type") == "tmpfs" and active_streams == 0 and pending_requests == 0:
+                await migrate_tmpfs_to_disk(fid, rec)
+                fpath = rec.get("filepath")
 
             if is_expired or is_missing:
                 # Active delivery must never be invalidated by maintenance
@@ -225,6 +370,59 @@ async def run_maintenance_tasks():
             oldest_formats = sorted(format_cache.keys(), key=lambda k: format_cache[k]["expires"])
             while len(format_cache) > 500 and oldest_formats:
                 format_cache.pop(oldest_formats.pop(0), None)
+
+        # Inspect actual tmpfs directory for unregistered / genuine orphaned files
+        if os.path.exists(TMPFS_DOWNLOAD_DIR):
+            try:
+                # Set of registered files and identifiers currently tracked in active_file_map
+                tracked_files = {
+                    os.path.abspath(r["filepath"])
+                    for r in active_file_map.values()
+                    if r.get("filepath")
+                }
+                tracked_fids = set(active_file_map.keys())
+                active_uuids = set(active_downloads.keys())
+
+                for fname in os.listdir(TMPFS_DOWNLOAD_DIR):
+                    tmpfs_fpath = os.path.join(TMPFS_DOWNLOAD_DIR, fname)
+                    abs_tmpfs_path = os.path.abspath(tmpfs_fpath)
+
+                    if not os.path.isfile(tmpfs_fpath):
+                        continue
+
+                    # Never remove files associated with registered deliveries in active_file_map
+                    if abs_tmpfs_path in tracked_files or any(fname.startswith(fid) for fid in tracked_fids):
+                        continue
+
+                    # Never remove files associated with active in-progress downloads
+                    if any(fname.startswith(u) for u in active_uuids):
+                        continue
+
+                    # Never remove files created very recently (within 60s) to protect in-flight moves and registrations
+                    try:
+                        mtime = os.path.getmtime(tmpfs_fpath)
+                        if (now - mtime) < 60:
+                            continue
+                    except OSError:
+                        continue
+
+                    # Resolve file_id candidate from filename if available for diagnostic correlation
+                    base_name = os.path.splitext(fname)[0]
+                    first_part = base_name.split(".")[0]
+                    orphan_fid = base_name if len(base_name) == 36 else (first_part if len(first_part) == 36 else None)
+
+                    # Safely remove genuine orphaned tmpfs files to prevent RAM disk starvation
+                    print(f"[MAINTENANCE] Removing genuine orphaned tmpfs file: {tmpfs_fpath}")
+                    cleanup_file(tmpfs_fpath, trigger="orphan_tmpfs_cleanup", file_id=orphan_fid)
+            except Exception as tmpfs_err:
+                print(f"Warning: Error inspecting tmpfs directory for orphans: {tmpfs_err}")
+                if diagnostic_logger.is_enabled():
+                    diagnostic_logger.log_event(
+                        "tmpfs_orphan_scan_error",
+                        level="ERROR",
+                        details={"error": str(tmpfs_err)},
+                        error=str(tmpfs_err)
+                    )
 
     for filepath in files_to_clean:
         cleanup_file(filepath, trigger="maintenance_expiry")
@@ -424,21 +622,29 @@ def cleanup_file(filepath: str, trigger: typing.Optional[str] = None, job_id: ty
     err_str = None
     if exists_before:
         try:
-            os.remove(filepath)
+            try:
+                os.remove(filepath)
+            except PermissionError:
+                os.chmod(filepath, stat.S_IWRITE | stat.S_IREAD)
+                os.remove(filepath)
             success = True
         except Exception as e:
             err_str = str(e)
 
     if not file_id:
         base = os.path.splitext(os.path.basename(filepath))[0]
+        first_part = base.split(".")[0]
         if len(base) == 36:
             file_id = base
+        elif len(first_part) == 36:
+            file_id = first_part
 
     if diagnostic_logger.is_enabled():
         diagnostic_logger.log_event(
             "file_cleanup",
             job_id=job_id,
             file_id=file_id,
+            level="INFO" if success else "ERROR",
             details={
                 "filepath": filepath,
                 "trigger": trigger or "unspecified",
@@ -446,7 +652,8 @@ def cleanup_file(filepath: str, trigger: typing.Optional[str] = None, job_id: ty
                 "existed": exists_before,
                 "deleted": success,
                 "error": err_str
-            }
+            },
+            error=err_str
         )
 
 def sanitize_filename(name: str) -> str:
@@ -506,14 +713,6 @@ def clean_media_title(info: dict) -> str:
 def clean_terminal_ansi(text: str) -> str:
     return re.sub(r'\x1b\[[0-9;]*m', '', str(text))
 
-current_dir = os.path.dirname(os.path.abspath(__file__))
-frontend_dir = os.path.join(current_dir, "frontend")
-TEMP_DOWNLOAD_DIR = os.path.join(current_dir, "temp_downloads")
-TMPFS_DOWNLOAD_DIR = os.path.join(current_dir, "temp_downloads_tmpfs")
-RUN_DIR = os.path.join(current_dir, "run")
-os.makedirs(TEMP_DOWNLOAD_DIR, exist_ok=True)
-os.makedirs(TMPFS_DOWNLOAD_DIR, exist_ok=True)
-os.makedirs(RUN_DIR, exist_ok=True)
 
 def add_delivered_range(delivered_ranges: list, start: int, end: int) -> list:
     """
@@ -627,7 +826,11 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
 
             # Always remove the completed/evaluated request ID
             pending_set.discard(request_id)
-            print(f"[NGINX_LOG] Request removed: file_id={file_id}, request_id={request_id} (remaining pending: {len(pending_set)})")
+            rec.get("pending_request_times", {}).pop(request_id, None)
+
+            # Decrement active_streams exactly once
+            rec["active_streams"] = max(0, rec.get("active_streams", 1) - 1)
+            print(f"[NGINX_LOG] Request removed: file_id={file_id}, request_id={request_id} (remaining pending: {len(pending_set)}, active_streams: {rec.get('active_streams', 0)})")
 
             file_size = rec.get("size", 0)
             delivered_ranges = rec.setdefault("delivered_ranges", [])
@@ -767,13 +970,23 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
                                 len(current_rec.get("pending_requests", set())) == 0 and
                                 is_fully_covered(current_rec.get("delivered_ranges", []), current_rec.get("size", 0))
                             ):
+                                current_filepath = current_rec.get("filepath") or filepath
                                 print(f"[NGINX_LOG] Decision: DELETE file_id={file_id} (quiet period elapsed, 0 pending requests, full coverage verified)")
                                 active_file_map.pop(file_id, None)
                                 if pending_disconnect_cleanups.get(file_id) is this_task:
                                     pending_disconnect_cleanups.pop(file_id, None)
-                                cleanup_file(filepath, trigger="nginx_quiet_period_elapsed", job_id=jid, file_id=file_id)
+                                cleanup_file(current_filepath, trigger="nginx_quiet_period_elapsed", job_id=jid, file_id=file_id)
+                                if current_filepath != filepath and os.path.exists(filepath):
+                                    cleanup_file(filepath, trigger="nginx_quiet_period_elapsed_original")
                             else:
                                 print(f"[NGINX_LOG] Decision: KEEP file_id={file_id} (quiet period cancelled or new requests registered)")
+                                if (
+                                    current_rec is not None and
+                                    len(current_rec.get("pending_requests", set())) == 0 and
+                                    current_rec.get("active_streams", 0) == 0 and
+                                    current_rec.get("storage_type") == "tmpfs"
+                                ):
+                                    await migrate_tmpfs_to_disk(file_id, current_rec)
                     except asyncio.CancelledError:
                         pass
                     finally:
@@ -788,7 +1001,11 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
                 pending_disconnect_cleanups[file_id] = this_task
             else:
                 coverage_info = rec.get("delivered_ranges", [])
-                print(f"[NGINX_LOG] Decision: KEEP file_id={file_id} (covered={coverage_info}, file_size={file_size}, pending_requests={remaining_requests})")
+                active_streams = rec.get("active_streams", 0)
+                print(f"[NGINX_LOG] Decision: KEEP file_id={file_id} (covered={coverage_info}, file_size={file_size}, pending_requests={remaining_requests}, active_streams={active_streams})")
+                if remaining_requests == 0 and active_streams == 0:
+                    if rec.get("storage_type") == "tmpfs":
+                        await migrate_tmpfs_to_disk(file_id, rec)
 
 class ResilientFileResponse(FileResponse):
     def __init__(self, *args, on_completed=None, on_disconnected=None, **kwargs):
@@ -820,20 +1037,45 @@ class ResilientFileResponse(FileResponse):
                         # Shield callback execution against cancellation to guarantee active_streams decrement
                         await asyncio.shield(res)
 
+def remove_path_force(target_path: str):
+    """
+    Deletes a file, symlink, or directory tree during startup cleanup.
+    Handles read-only attributes on Windows and POSIX.
+    If removal fails, logs the exact path and error, then raises RuntimeError to fail startup.
+    """
+    try:
+        if os.path.isdir(target_path) and not os.path.islink(target_path):
+            def _handle_readonly(func, path, exc_info):
+                try:
+                    os.chmod(path, stat.S_IWRITE | stat.S_IREAD)
+                    func(path)
+                except Exception:
+                    raise exc_info[1]
+
+            shutil.rmtree(target_path, onerror=_handle_readonly)
+        else:
+            try:
+                os.remove(target_path)
+            except PermissionError:
+                os.chmod(target_path, stat.S_IWRITE | stat.S_IREAD)
+                os.remove(target_path)
+    except Exception as e:
+        print(f"CRITICAL STARTUP ERROR: Could not remove temporary asset at {target_path} - {e}")
+        raise RuntimeError(f"Startup cleanup failed: Could not remove {target_path}: {e}") from e
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup: Clean up any abandoned temporary files from previous runs
-    for target_dir in (TEMP_DOWNLOAD_DIR, TMPFS_DOWNLOAD_DIR):
-        if os.path.exists(target_dir):
-            for filename in os.listdir(target_dir):
-                file_path = os.path.join(target_dir, filename)
-                try:
-                    if os.path.isfile(file_path):
-                        os.remove(file_path)
-                except Exception as e:
-                    print(f"Startup cleanup error: Could not remove {file_path} - {e}")
+    # 1. Reset in-memory download registrations and pending request state during startup
+    # Do not preserve or recover downloads from previous runs
+    async with state_lock:
+        active_file_map.clear()
+        active_downloads.clear()
+        active_download_tasks.clear()
+        pending_disconnect_cleanups.clear()
+        format_cache.clear()
 
-    # Initialize SQLite database for mobile job management with clean-slate model
+    # 2. Reset SQLite mobile jobs database and in-memory mobile API state
     try:
         job_manager.init_db()
         cleared_count = job_manager.clear_all_jobs()
@@ -842,6 +1084,21 @@ async def lifespan(app: FastAPI):
         print(f"Mobile jobs clean slate startup complete (cleared {cleared_count} previous records).")
     except Exception as db_init_err:
         print(f"Warning: Failed to initialize/clear mobile jobs SQLite database: {db_init_err}")
+
+    # 3. Clear ALL contents of TMPFS_DOWNLOAD_DIR and TEMP_DOWNLOAD_DIR on startup
+    # Never silently skip leftovers; fail startup if any item cannot be removed
+    for target_dir in (TMPFS_DOWNLOAD_DIR, TEMP_DOWNLOAD_DIR):
+        if not os.path.exists(target_dir):
+            continue
+        try:
+            entries = os.listdir(target_dir)
+        except Exception as ls_err:
+            print(f"CRITICAL STARTUP ERROR: Could not list directory {target_dir} - {ls_err}")
+            raise RuntimeError(f"Startup cleanup failed: Could not list {target_dir}: {ls_err}") from ls_err
+
+        for filename in entries:
+            file_path = os.path.join(target_dir, filename)
+            remove_path_force(file_path)
 
     maintenance_task = asyncio.create_task(periodic_maintenance_loop())
 
@@ -1690,10 +1947,13 @@ async def deliver_file_response(request: Request, file_id: str, title: str, job_
                     current_rec = active_file_map.get(file_id)
                     # Verify record identity and that zero streams are active
                     if current_rec is rec and current_rec.get("active_streams", 0) == 0:
+                        current_filepath = current_rec.get("filepath") or filepath
                         active_file_map.pop(file_id, None)
                         if pending_disconnect_cleanups.get(file_id) is this_task:
                             pending_disconnect_cleanups.pop(file_id, None)
-                        cleanup_file(filepath, trigger="inactivity_grace_elapsed", job_id=current_rec.get("job_id"), file_id=file_id)
+                        cleanup_file(current_filepath, trigger="inactivity_grace_elapsed", job_id=current_rec.get("job_id"), file_id=file_id)
+                        if current_filepath != filepath and os.path.exists(filepath):
+                            cleanup_file(filepath, trigger="inactivity_grace_elapsed_original")
             except asyncio.CancelledError:
                 pass
             finally:
@@ -1759,15 +2019,20 @@ async def deliver_file_response(request: Request, file_id: str, title: str, job_
 
             # Immediate cleanup only when fully covered and no other streams are active
             if fully_covered and remaining_streams == 0:
+                current_filepath = rec.get("filepath") or filepath
                 active_file_map.pop(file_id, None)
                 timer = pending_disconnect_cleanups.pop(file_id, None)
                 if timer:
                     timer.cancel()
-                cleanup_file(filepath, trigger="delivery_fully_covered", job_id=rec.get("job_id"), file_id=file_id)
+                cleanup_file(current_filepath, trigger="delivery_fully_covered", job_id=rec.get("job_id"), file_id=file_id)
+                if current_filepath != filepath and os.path.exists(filepath):
+                    cleanup_file(filepath, trigger="delivery_fully_covered_original")
                 return
 
             # For Range requests, disconnects, or partial streams with 0 active streams, start 60s grace timer
             if remaining_streams == 0:
+                if rec.get("storage_type") == "tmpfs":
+                    await migrate_tmpfs_to_disk(file_id, rec)
                 schedule_inactivity_cleanup(rec)
 
     # Mode 1: Nginx X-Accel-Redirect delivery
@@ -1782,6 +2047,7 @@ async def deliver_file_response(request: Request, file_id: str, title: str, job_
             if rec:
                 pending_set = rec.setdefault("pending_requests", set())
                 pending_set.add(request_id)
+                rec.setdefault("pending_request_times", {})[request_id] = time.time()
                 print(f"[NGINX_LOG] Request registered: file_id={file_id}, request_id={request_id} (pending: {len(pending_set)})")
 
         internal_uri = f"{internal_base}?sv_fid={file_id}&sv_rid={request_id}"
