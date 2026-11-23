@@ -607,6 +607,15 @@ class DownloadCancelled(Exception):
     pass
 
 
+class ReadOnlyYoutubeDL(yt_dlp.YoutubeDL):
+    """
+    Custom YoutubeDL wrapper that suppresses automatic cookie-jar serialization to disk.
+    Treats cookies.txt as a strictly read-only credential source.
+    """
+    def save_cookies(self):
+        pass
+
+
 ### --- SECTION 6: UTILITY FUNCTIONS & APP INIT --- ###
 def cleanup_file(filepath: str, trigger: typing.Optional[str] = None, job_id: typing.Optional[str] = None, file_id: typing.Optional[str] = None):
     if not filepath:
@@ -1296,7 +1305,7 @@ async def get_options(url: str):
         ydl_opts['cookiefile'] = cookie_path
 
     def fetch_metadata():
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        with ReadOnlyYoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
             video_title = clean_media_title(info) if isinstance(info, dict) else "video"
             raw_formats = info.get('formats', [])
@@ -1483,7 +1492,7 @@ async def execute_download_core(
                     file_id=file_uuid,
                     details={"format_id": format_id, "url": diagnostic_logger.sanitize_url_for_logging(url)}
                 )
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            with ReadOnlyYoutubeDL(ydl_opts) as ydl:
                 info = None
                 if hasattr(ydl, "extract_info"):
                     info = ydl.extract_info(url, download=True)
