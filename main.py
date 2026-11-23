@@ -1433,6 +1433,15 @@ async def deliver_file_response(request: Request, file_id: str, title: str, job_
 
     if safe_name.lower().endswith(ext.lower()):
         safe_name = safe_name[:-len(ext)].rstrip(". ")
+
+    # Bound HTTP download filename length to prevent oversized headers (e.g. Nginx 502 upstream header overflow)
+    # Long Unicode/Malayalam titles can expand dramatically when percent-encoded (up to 9x bytes).
+    MAX_DOWNLOAD_NAME_LENGTH = 80
+    if len(safe_name) > MAX_DOWNLOAD_NAME_LENGTH:
+        safe_name = safe_name[:MAX_DOWNLOAD_NAME_LENGTH]
+        while safe_name and (unicodedata.combining(safe_name[-1]) or safe_name[-1] in ". "):
+            safe_name = safe_name[:-1]
+
     if not safe_name:
         safe_name = "StreamVault_Download"
 
@@ -1440,6 +1449,8 @@ async def deliver_file_response(request: Request, file_id: str, title: str, job_
     media_type = guessed_type or ("video/mp4" if ext == ".mp4" else "application/octet-stream")
     encoded_filename = quote(f"{safe_name}{ext}")
     ascii_safe_name = re.sub(r'\s+', ' ', re.sub(r'[^\x20-\x7E]', ' ', safe_name).replace('"', '')).strip(". ")
+    if len(ascii_safe_name) > MAX_DOWNLOAD_NAME_LENGTH:
+        ascii_safe_name = ascii_safe_name[:MAX_DOWNLOAD_NAME_LENGTH].strip(". ")
     if not ascii_safe_name:
         ascii_safe_name = "StreamVault_Download"
 

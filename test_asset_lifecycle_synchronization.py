@@ -246,6 +246,44 @@ class TestAssetLifecycleSynchronization(unittest.IsolatedAsyncioTestCase):
         job = job_manager.get_job(jid)
         self.assertEqual(job["status"], "delivering")
 
+    # 8. Oversized Unicode titles produce bounded Content-Disposition headers (< 1KB)
+    async def test_08_oversized_title_bounded_content_disposition(self):
+        jid = "job_huge_title"
+        fid = str(uuid.uuid4())
+        fpath = os.path.join(self.test_dir, f"{fid}.mp4")
+        with open(fpath, "wb") as f:
+            f.write(b"H" * 100)
+
+        # 500-character Malayalam title that would expand to ~4.5 KB without truncation
+        huge_malayalam_title = "കണ്ണൂര്‍ എഡിഎമ്മിന്റെ മരണത്തിൽ " * 15
+        job_manager.create_job(jid, "https://example.com/huge", status="ready", title=huge_malayalam_title)
+        job_manager.update_job(jid, file_id=fid)
+
+        async with main.state_lock:
+            main.active_file_map[fid] = {
+                "filepath": fpath,
+                "size": 100,
+                "expires": time.time() + 3600,
+                "storage_type": "disk",
+                "active_streams": 0,
+                "pending_requests": set(),
+                "job_id": jid,
+            }
+
+        # Test Nginx Mode 1
+        main.USE_X_ACCEL_REDIRECT = True
+        req = MockRequest()
+        resp_nx = await mobile_api.download_mobile_job(req, jid)
+        cd_nx = resp_nx.headers.get("content-disposition", "")
+        # Header must be bounded (well under 1.5 KB to prevent Nginx 502)
+        self.assertLess(len(cd_nx), 1500)
+        self.assertIn(".mp4", cd_nx)
+        self.assertIn("filename*=UTF-8''", cd_nx)
+
+        # Verify database record title remains untruncated
+        job = job_manager.get_job(jid)
+        self.assertEqual(job["title"], huge_malayalam_title)
+
 
 if __name__ == "__main__":
     unittest.main()
