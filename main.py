@@ -15,7 +15,9 @@ import unicodedata
 import shutil
 import typing
 import diagnostic_timing
+import diagnostic_logger
 import job_manager
+import traceback
 from contextlib import asynccontextmanager
 from urllib.parse import urlparse, parse_qs, quote
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request, Depends
@@ -225,11 +227,18 @@ async def run_maintenance_tasks():
                 format_cache.pop(oldest_formats.pop(0), None)
 
     for filepath in files_to_clean:
-        cleanup_file(filepath)
+        cleanup_file(filepath, trigger="maintenance_expiry")
 
     for jid, fid in jobs_to_expire:
         try:
             job_manager.expire_job_asset(job_id=jid, file_id=fid)
+            if diagnostic_logger.is_enabled():
+                diagnostic_logger.log_event(
+                    "maintenance_asset_expired",
+                    job_id=jid,
+                    file_id=fid,
+                    details={"job_id": jid, "file_id": fid}
+                )
         except Exception as expire_err:
             print(f"Warning: Failed to expire mobile job {jid or fid}: {expire_err}")
 
@@ -401,12 +410,44 @@ class DownloadCancelled(Exception):
 
 
 ### --- SECTION 6: UTILITY FUNCTIONS & APP INIT --- ###
-def cleanup_file(filepath: str):
-    if os.path.exists(filepath):
+def cleanup_file(filepath: str, trigger: typing.Optional[str] = None, job_id: typing.Optional[str] = None, file_id: typing.Optional[str] = None):
+    if not filepath:
+        return
+    exists_before = os.path.exists(filepath)
+    file_size = 0
+    if exists_before:
         try:
-            os.remove(filepath)
+            file_size = os.path.getsize(filepath)
         except Exception:
             pass
+    success = False
+    err_str = None
+    if exists_before:
+        try:
+            os.remove(filepath)
+            success = True
+        except Exception as e:
+            err_str = str(e)
+
+    if not file_id:
+        base = os.path.splitext(os.path.basename(filepath))[0]
+        if len(base) == 36:
+            file_id = base
+
+    if diagnostic_logger.is_enabled():
+        diagnostic_logger.log_event(
+            "file_cleanup",
+            job_id=job_id,
+            file_id=file_id,
+            details={
+                "filepath": filepath,
+                "trigger": trigger or "unspecified",
+                "file_size": file_size,
+                "existed": exists_before,
+                "deleted": success,
+                "error": err_str
+            }
+        )
 
 def sanitize_filename(name: str) -> str:
     return re.sub(r'[\\/*?:"<>|]', "", name)
@@ -662,6 +703,23 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
                     f"reason: {rejection_reason} for file_id={file_id}"
                 )
 
+            if diagnostic_logger.is_enabled():
+                diagnostic_logger.log_event(
+                    "nginx_datagram_received",
+                    job_id=rec.get("job_id"),
+                    file_id=file_id,
+                    details={
+                        "request_id": request_id,
+                        "status": status,
+                        "bytes_sent": bytes_sent,
+                        "content_length": content_length,
+                        "content_range": content_range,
+                        "delivered_interval": delivered_interval,
+                        "rejection_reason": rejection_reason,
+                        "file_size": file_size
+                    }
+                )
+
             if delivered_interval:
                 rec["delivered_ranges"] = add_delivered_range(
                     delivered_ranges,
@@ -682,6 +740,18 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
                     diagnostic_timing.tracker.record_delivery_end(jid, bytes_delivered=file_size)
 
                 print(f"[NGINX_LOG] Scheduling 5s quiet period before deletion for file_id={file_id}")
+                if diagnostic_logger.is_enabled():
+                    diagnostic_logger.log_event(
+                        "nginx_quiet_period_scheduled",
+                        job_id=jid,
+                        file_id=file_id,
+                        details={
+                            "file_id": file_id,
+                            "quiet_period_seconds": X_ACCEL_QUIET_PERIOD_SECONDS,
+                            "delivered_ranges": rec.get("delivered_ranges", []),
+                            "file_size": file_size
+                        }
+                    )
                 record_id = id(rec)
                 filepath = rec["filepath"]
 
@@ -701,7 +771,7 @@ class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
                                 active_file_map.pop(file_id, None)
                                 if pending_disconnect_cleanups.get(file_id) is this_task:
                                     pending_disconnect_cleanups.pop(file_id, None)
-                                cleanup_file(filepath)
+                                cleanup_file(filepath, trigger="nginx_quiet_period_elapsed", job_id=jid, file_id=file_id)
                             else:
                                 print(f"[NGINX_LOG] Decision: KEEP file_id={file_id} (quiet period cancelled or new requests registered)")
                     except asyncio.CancelledError:
@@ -1070,6 +1140,15 @@ async def execute_download_core(
         status = d.get('status')
         if status == 'downloading':
             diagnostic_timing.tracker.record_extraction_end(job_id)
+            if not captured_meta.get("_logged_dl_start"):
+                captured_meta["_logged_dl_start"] = True
+                if diagnostic_logger.is_enabled():
+                    diagnostic_logger.log_event(
+                        "ytdlp_media_download_start",
+                        job_id=job_id,
+                        file_id=file_uuid,
+                        details={"total_bytes": d.get('total_bytes') or d.get('total_bytes_estimate') or 0}
+                    )
             total = d.get('total_bytes') or d.get('total_bytes_estimate') or 0
             downloaded = d.get('downloaded_bytes', 0)
             percent = round((downloaded / total) * 100, 2) if total > 0 else 0
@@ -1095,6 +1174,15 @@ async def execute_download_core(
                 main_loop.call_soon_threadsafe(progress_callback, payload)
         elif status == 'finished':
             diagnostic_timing.tracker.record_media_download_end(job_id)
+            if not captured_meta.get("_logged_dl_end"):
+                captured_meta["_logged_dl_end"] = True
+                if diagnostic_logger.is_enabled():
+                    diagnostic_logger.log_event(
+                        "ytdlp_media_download_end",
+                        job_id=job_id,
+                        file_id=file_uuid,
+                        details={"downloaded_bytes": d.get('downloaded_bytes', 0)}
+                    )
 
     def postprocessor_hook(d):
         if cancel_event.is_set():
@@ -1102,6 +1190,15 @@ async def execute_download_core(
         status = d.get('status') if isinstance(d, dict) else None
         if status in (None, 'started'):
             diagnostic_timing.tracker.record_postprocess_start(job_id)
+            if not captured_meta.get("_logged_pp_start"):
+                captured_meta["_logged_pp_start"] = True
+                if diagnostic_logger.is_enabled():
+                    diagnostic_logger.log_event(
+                        "ytdlp_postprocess_start",
+                        job_id=job_id,
+                        file_id=file_uuid,
+                        details={"postprocessor": d.get('postprocessor') if isinstance(d, dict) else None}
+                    )
 
     cookie_path = os.path.join(current_dir, "cookies.txt")
     ydl_opts = {
@@ -1122,6 +1219,13 @@ async def execute_download_core(
     def run_native_download():
         try:
             diagnostic_timing.tracker.record_extraction_start(job_id)
+            if diagnostic_logger.is_enabled():
+                diagnostic_logger.log_event(
+                    "ytdlp_extraction_start",
+                    job_id=job_id,
+                    file_id=file_uuid,
+                    details={"format_id": format_id, "url": diagnostic_logger.sanitize_url_for_logging(url)}
+                )
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = None
                 if hasattr(ydl, "extract_info"):
@@ -1133,12 +1237,26 @@ async def execute_download_core(
                     if resolved_title:
                         captured_meta['title'] = resolved_title
             diagnostic_timing.tracker.record_postprocess_end(job_id)
+            if diagnostic_logger.is_enabled():
+                diagnostic_logger.log_event(
+                    "ytdlp_postprocess_end",
+                    job_id=job_id,
+                    file_id=file_uuid,
+                    details={"resolved_title": captured_meta.get('title')}
+                )
             return "DONE", None
         except DownloadCancelled:
             return "CANCELLED", None
         except Exception as e:
             err_text = clean_terminal_ansi(str(e))
             print(f"Download processing error for {url}: {err_text}")
+            if diagnostic_logger.is_enabled():
+                diagnostic_logger.log_event(
+                    "download_core_exception",
+                    job_id=job_id,
+                    file_id=file_uuid,
+                    details={"error": err_text, "traceback": traceback.format_exc()}
+                )
             return "ERROR", f"Failed to retrieve video metadata or download stream: {err_text}"
 
     worker_task = main_loop.run_in_executor(None, run_native_download)
@@ -1173,12 +1291,34 @@ async def execute_download_core(
                     try:
                         os.replace(downloaded_file, normalized_path)
                         downloaded_file = normalized_path
+                        if diagnostic_logger.is_enabled():
+                            diagnostic_logger.log_event(
+                                "extension_normalized",
+                                job_id=job_id,
+                                file_id=file_uuid,
+                                details={"raw_ext": raw_ext, "normalized_ext": ".mp4"}
+                            )
                     except Exception as ren_err:
                         print(f"Warning: Failed to normalize extension of {downloaded_file}: {ren_err}")
 
                 actual_size = os.path.getsize(downloaded_file)
                 target_path = downloaded_file
                 storage_type = "disk"
+
+                disk_free = shutil.disk_usage(TEMP_DOWNLOAD_DIR).free if os.path.exists(TEMP_DOWNLOAD_DIR) else 0
+                tmpfs_free = shutil.disk_usage(TMPFS_DOWNLOAD_DIR).free if os.path.exists(TMPFS_DOWNLOAD_DIR) else 0
+                if diagnostic_logger.is_enabled():
+                    diagnostic_logger.log_event(
+                        "storage_tiering_evaluation",
+                        job_id=job_id,
+                        file_id=file_uuid,
+                        details={
+                            "actual_size": actual_size,
+                            "threshold_bytes": TMPFS_THRESHOLD_BYTES,
+                            "disk_free_bytes": disk_free,
+                            "tmpfs_free_bytes": tmpfs_free
+                        }
+                    )
 
                 # Hybrid storage tiering: move files < 200 MB to dedicated 200 MB tmpfs
                 if actual_size < TMPFS_THRESHOLD_BYTES:
@@ -1187,12 +1327,26 @@ async def execute_download_core(
                         shutil.move(downloaded_file, tmpfs_dest)
                         target_path = tmpfs_dest
                         storage_type = "tmpfs"
+                        if diagnostic_logger.is_enabled():
+                            diagnostic_logger.log_event(
+                                "storage_tiering_result",
+                                job_id=job_id,
+                                file_id=file_uuid,
+                                details={"storage_type": "tmpfs", "dest": tmpfs_dest}
+                            )
                     except Exception as move_err:
                         print(f"Warning: Failed to move {downloaded_file} to tmpfs: {move_err}. Retaining on disk.")
                         # Ensure any partial or corrupted destination file on tmpfs is cleaned up
-                        cleanup_file(tmpfs_dest)
+                        cleanup_file(tmpfs_dest, trigger="tmpfs_move_error", job_id=job_id, file_id=file_uuid)
                         target_path = downloaded_file
                         storage_type = "disk"
+                        if diagnostic_logger.is_enabled():
+                            diagnostic_logger.log_event(
+                                "storage_tiering_result",
+                                job_id=job_id,
+                                file_id=file_uuid,
+                                details={"storage_type": "disk", "fallback_reason": str(move_err)}
+                            )
 
                 async with state_lock:
                     active_file_map[file_uuid] = {
@@ -1202,6 +1356,19 @@ async def execute_download_core(
                         "size": actual_size,
                         "job_id": job_id
                     }
+
+                if diagnostic_logger.is_enabled():
+                    diagnostic_logger.log_event(
+                        "download_core_outcome",
+                        job_id=job_id,
+                        file_id=file_uuid,
+                        details={
+                            "outcome": "DONE",
+                            "storage_type": storage_type,
+                            "size": actual_size,
+                            "title": captured_meta.get("title", "Video")
+                        }
+                    )
                 return {
                     "status": "completed",
                     "file_id": file_uuid,
@@ -1211,11 +1378,32 @@ async def execute_download_core(
                     "title": captured_meta.get("title", "Video")
                 }
             else:
+                if diagnostic_logger.is_enabled():
+                    diagnostic_logger.log_event(
+                        "download_core_outcome",
+                        job_id=job_id,
+                        file_id=file_uuid,
+                        details={"outcome": "FAILED", "error": "Assembly merging failure."}
+                    )
                 return {"status": "failed", "error": "Assembly merging failure."}
 
         elif outcome == "CANCELLED":
+            if diagnostic_logger.is_enabled():
+                diagnostic_logger.log_event(
+                    "download_core_outcome",
+                    job_id=job_id,
+                    file_id=file_uuid,
+                    details={"outcome": "CANCELLED", "error": "Download Cancelled."}
+                )
             return {"status": "cancelled", "error": "Download Cancelled."}
         else:
+            if diagnostic_logger.is_enabled():
+                diagnostic_logger.log_event(
+                    "download_core_outcome",
+                    job_id=job_id,
+                    file_id=file_uuid,
+                    details={"outcome": "FAILED", "error": err_msg}
+                )
             return {"status": "failed", "error": err_msg or "Download failed due to an internal error. Please try again."}
 
     finally:
@@ -1242,7 +1430,7 @@ async def execute_download_core(
                             if not has_claimed:
                                 for f in os.listdir(TEMP_DOWNLOAD_DIR):
                                     if f.startswith(file_uuid):
-                                        cleanup_file(os.path.join(TEMP_DOWNLOAD_DIR, f))
+                                        cleanup_file(os.path.join(TEMP_DOWNLOAD_DIR, f), trigger="background_reaper", job_id=job_id, file_id=file_uuid)
                         except Exception as reaper_err:
                             print(f"Error during background reaper cleanup for {file_uuid}: {clean_terminal_ansi(str(reaper_err))}")
                 reaper_task = asyncio.create_task(background_reaper())
@@ -1267,7 +1455,7 @@ async def execute_download_core(
                 if not has_claimed_file:
                     for f in os.listdir(TEMP_DOWNLOAD_DIR):
                         if f.startswith(file_uuid):
-                            cleanup_file(os.path.join(TEMP_DOWNLOAD_DIR, f))
+                            cleanup_file(os.path.join(TEMP_DOWNLOAD_DIR, f), trigger="unclaimed_download_cleanup", job_id=job_id, file_id=file_uuid)
             except Exception as e:
                 print(f"Error during physical file cleanup for {file_uuid}: {clean_terminal_ansi(str(e))}")
 
@@ -1415,7 +1603,7 @@ async def deliver_file_response(request: Request, file_id: str, title: str, job_
         if time.time() >= file_record["expires"]:
             file_record["active_streams"] = max(0, file_record["active_streams"] - 1)
             active_file_map.pop(file_id, None)
-            cleanup_file(filepath)
+            cleanup_file(filepath, trigger="asset_expired", job_id=resolved_job_id, file_id=file_id)
             job_manager.expire_job_asset(job_id=resolved_job_id, file_id=file_id)
             raise HTTPException(status_code=404, detail="Asset has expired.")
 
@@ -1471,8 +1659,30 @@ async def deliver_file_response(request: Request, file_id: str, title: str, job_
             except ValueError:
                 range_bounds = None
 
+    if diagnostic_logger.is_enabled():
+        diagnostic_logger.log_event(
+            "delivery_request_received",
+            job_id=resolved_job_id,
+            file_id=file_id,
+            details={
+                "delivery_mode": "nginx_xaccel" if USE_X_ACCEL_REDIRECT else "python_stream",
+                "range_header": range_header,
+                "is_range_request": is_range_request,
+                "range_bounds": range_bounds,
+                "file_size": file_size,
+                "storage_type": storage_type
+            }
+        )
+
     def schedule_inactivity_cleanup(rec):
         """Helper to schedule a safe 60s delayed cleanup verifying record identity."""
+        if diagnostic_logger.is_enabled():
+            diagnostic_logger.log_event(
+                "inactivity_cleanup_scheduled",
+                job_id=rec.get("job_id"),
+                file_id=file_id,
+                details={"grace_seconds": DISCONNECT_CLEANUP_GRACE_SECONDS}
+            )
         async def delayed_disconnect_cleanup():
             try:
                 await asyncio.sleep(DISCONNECT_CLEANUP_GRACE_SECONDS)
@@ -1483,7 +1693,7 @@ async def deliver_file_response(request: Request, file_id: str, title: str, job_
                         active_file_map.pop(file_id, None)
                         if pending_disconnect_cleanups.get(file_id) is this_task:
                             pending_disconnect_cleanups.pop(file_id, None)
-                        cleanup_file(filepath)
+                        cleanup_file(filepath, trigger="inactivity_grace_elapsed", job_id=current_rec.get("job_id"), file_id=file_id)
             except asyncio.CancelledError:
                 pass
             finally:
@@ -1522,6 +1732,21 @@ async def deliver_file_response(request: Request, file_id: str, title: str, job_
 
             fully_covered = is_fully_covered(rec.get("delivered_ranges", []), file_size)
 
+            if diagnostic_logger.is_enabled():
+                diagnostic_logger.log_event(
+                    "stream_ended" if was_full_success else "stream_interrupted",
+                    job_id=rec.get("job_id") or resolved_job_id,
+                    file_id=file_id,
+                    details={
+                        "was_full_success": was_full_success,
+                        "is_range_request": is_range_request,
+                        "range_bounds": range_bounds,
+                        "remaining_streams": remaining_streams,
+                        "delivered_ranges": rec.get("delivered_ranges", []),
+                        "fully_covered": fully_covered
+                    }
+                )
+
             # If full byte coverage is achieved, update mobile job status to completed idempotently
             if fully_covered:
                 jid = rec.get("job_id")
@@ -1538,7 +1763,7 @@ async def deliver_file_response(request: Request, file_id: str, title: str, job_
                 timer = pending_disconnect_cleanups.pop(file_id, None)
                 if timer:
                     timer.cancel()
-                cleanup_file(filepath)
+                cleanup_file(filepath, trigger="delivery_fully_covered", job_id=rec.get("job_id"), file_id=file_id)
                 return
 
             # For Range requests, disconnects, or partial streams with 0 active streams, start 60s grace timer
@@ -1560,6 +1785,18 @@ async def deliver_file_response(request: Request, file_id: str, title: str, job_
                 print(f"[NGINX_LOG] Request registered: file_id={file_id}, request_id={request_id} (pending: {len(pending_set)})")
 
         internal_uri = f"{internal_base}?sv_fid={file_id}&sv_rid={request_id}"
+
+        if diagnostic_logger.is_enabled():
+            diagnostic_logger.log_event(
+                "nginx_xaccel_registered",
+                job_id=resolved_job_id,
+                file_id=file_id,
+                details={
+                    "request_id": request_id,
+                    "internal_uri": internal_uri,
+                    "pending_requests_count": len(pending_set) if rec else 0
+                }
+            )
 
         headers = {
             "X-Accel-Redirect": internal_uri,

@@ -15,10 +15,10 @@ WORKDIR /app
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY main.py job_manager.py mobile_api.py diagnostic_timing.py ./
+COPY main.py job_manager.py mobile_api.py diagnostic_timing.py diagnostic_logger.py ./
 COPY frontend/ ./frontend/
 
-RUN mkdir -p /app/temp_downloads /app/temp_downloads_tmpfs /app/run /app/data
+RUN mkdir -p /app/temp_downloads /app/temp_downloads_tmpfs /app/run /app/data /app/logs
 
 EXPOSE 8300
 

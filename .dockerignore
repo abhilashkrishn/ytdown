@@ -10,4 +10,6 @@ __pycache__
 venv
 temp_downloads
 downloads
+logs/
+*.jsonl
 *.log

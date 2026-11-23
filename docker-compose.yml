@@ -5,6 +5,8 @@ services:
     restart: unless-stopped
     ports:
       - "127.0.0.1:8300:8300"
+    environment:
+      - DIAGNOSTICS_ENABLED=${DIAGNOSTICS_ENABLED:-false}
     env_file:
       - .env
     volumes:
@@ -12,6 +14,7 @@ services:
       - ./temp_downloads_tmpfs:/app/temp_downloads_tmpfs
       - ./run:/app/run
       - ./data:/app/data
+      - ./logs:/app/logs
       - ./.env:/app/.env:ro
       - ./cookies.txt:/app/cookies.txt
     init: true

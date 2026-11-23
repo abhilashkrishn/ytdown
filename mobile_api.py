@@ -20,6 +20,7 @@ import asyncio
 import os
 import threading
 import time
+import traceback
 import uuid
 from typing import Any, Dict, Optional, Set
 from fastapi import APIRouter, HTTPException, Request
@@ -28,6 +29,7 @@ from pydantic import BaseModel
 import job_manager
 import main
 import diagnostic_timing
+import diagnostic_logger
 
 router = APIRouter(prefix="/api/mobile", tags=["mobile"])
 
@@ -106,6 +108,8 @@ async def process_mobile_queue() -> None:
             url = job["url"]
 
             file_uuid = str(uuid.uuid4())
+            diagnostic_logger.associate_file_id(job_id, file_uuid)
+            diagnostic_logger.log_event("job_claimed_from_queue", job_id=job_id, file_id=file_uuid, details={"total_in_flight": total_in_flight, "available_slots": available_slots})
             cancel_event = threading.Event()
 
             # Pre-register in memory synchronously before creating task to prevent race conditions
@@ -139,6 +143,9 @@ async def _execute_mobile_job(
     if cancel_event is None:
         cancel_event = threading.Event()
 
+    diagnostic_logger.associate_file_id(job_id, file_uuid)
+    diagnostic_logger.log_event("worker_execution_start", job_id=job_id, file_id=file_uuid)
+
     # Pre-register in memory if not already present
     if job_id not in _active_mobile_jobs:
         _active_mobile_jobs[job_id] = {
@@ -154,6 +161,7 @@ async def _execute_mobile_job(
 
         # Transition lifecycle state to downloading
         job_manager.update_job(job_id, status="downloading")
+        diagnostic_logger.log_event("state_transition", job_id=job_id, details={"to_status": "downloading"})
 
         last_status = "downloading"
         captured_title_set = False
@@ -177,6 +185,11 @@ async def _execute_mobile_job(
             if target_status != last_status:
                 transition_status = target_status
                 last_status = target_status
+                diagnostic_logger.log_event(
+                    "state_transition",
+                    job_id=job_id,
+                    details={"from_status": "downloading", "to_status": target_status, "progress": percent}
+                )
 
             job_manager.update_progress(
                 job_id=job_id,
@@ -222,6 +235,12 @@ async def _execute_mobile_job(
                 title=final_title,
                 total_bytes=int(actual_size) if actual_size else 0
             )
+            diagnostic_logger.log_event(
+                "job_ready",
+                job_id=job_id,
+                file_id=file_uuid,
+                details={"title": final_title, "file_size": actual_size}
+            )
             diagnostic_timing.tracker.record_ready(
                 job_id=job_id,
                 file_id=file_uuid,
@@ -234,16 +253,20 @@ async def _execute_mobile_job(
                 status="cancelled",
                 error_message="Download Cancelled."
             )
+            diagnostic_logger.log_event("job_cancelled", job_id=job_id, file_id=file_uuid)
         else:
+            err_msg = result.get("error", "Download failed.")
             job_manager.update_job(
                 job_id=job_id,
                 status="failed",
-                error_message=result.get("error", "Download failed.")
+                error_message=err_msg
             )
+            diagnostic_logger.log_event("job_failed", job_id=job_id, file_id=file_uuid, level="ERROR", error=err_msg)
 
     except asyncio.CancelledError:
         cancel_event.set()
         job_manager.update_job(job_id, status="cancelled")
+        diagnostic_logger.log_event("job_cancelled", job_id=job_id, file_id=file_uuid)
         raise
     except Exception as e:
         print(f"Unexpected error in mobile job {job_id}: {main.clean_terminal_ansi(str(e))}")
@@ -252,6 +275,7 @@ async def _execute_mobile_job(
             status="failed",
             error_message="Download failed due to an internal error."
         )
+        diagnostic_logger.log_event("worker_exception", job_id=job_id, file_id=file_uuid, level="ERROR", error=str(e), traceback_str=traceback.format_exc())
     finally:
         _active_mobile_jobs.pop(job_id, None)
         # Concurrency slot freed; schedule next queued job
@@ -282,9 +306,11 @@ async def submit_job(payload: SubmitRequest):
         )
 
     job_id = str(uuid.uuid4())
+    diagnostic_logger.activate_job(job_id, url)
     diagnostic_timing.tracker.record_submission_received(job_id, url)
     job = job_manager.create_job(job_id=job_id, url=url, status="queued")
     diagnostic_timing.tracker.record_queued(job_id)
+    diagnostic_logger.log_event("job_queued", job_id=job_id, details={"status": "queued", "active_count": active_count + 1})
 
     schedule_mobile_queue()
 
@@ -298,8 +324,10 @@ async def submit_job(payload: SubmitRequest):
 @router.get("/status/{job_id}")
 async def get_job_status(job_id: str):
     """Returns persisted job state and real-time live progress."""
+    t0 = time.perf_counter()
     job = job_manager.get_job(job_id)
     if not job:
+        diagnostic_logger.log_event("api_status_request", job_id=job_id, duration_ms=(time.perf_counter() - t0) * 1000.0, level="WARN", details={"status": "not_found"})
         raise HTTPException(status_code=404, detail="Job not found")
 
     status = job.get("status")
@@ -324,19 +352,22 @@ async def get_job_status(job_id: str):
                     # In active_file_map but expired or physical file is missing
                     main.active_file_map.pop(file_id, None)
                     if rec.get("filepath"):
-                        main.cleanup_file(rec["filepath"])
+                        main.cleanup_file(rec["filepath"], trigger="status_check_missing_or_expired", job_id=job_id, file_id=file_id)
 
         if not is_valid:
             # Asset is expired or missing; transition atomically from ready to asset_expired
             job_manager.expire_job_asset(job_id=job_id, file_id=file_id)
             refreshed = job_manager.get_job(job_id)
-            return refreshed or {**job, "status": "asset_expired", "error_message": "Asset expired on server."}
+            resp = refreshed or {**job, "status": "asset_expired", "error_message": "Asset expired on server."}
+            diagnostic_logger.log_event("api_status_request", job_id=job_id, file_id=file_id, duration_ms=(time.perf_counter() - t0) * 1000.0, details={"status": "asset_expired", "reason": "asset_missing_or_expired"})
+            return resp
 
         # Asset is valid and physically present
         if actual_size and (job.get("total_bytes") is None or job.get("total_bytes") <= 0):
             job["total_bytes"] = int(actual_size)
             job_manager.update_job(job_id, total_bytes=int(actual_size))
 
+    diagnostic_logger.log_event("api_status_request", job_id=job_id, file_id=job.get("file_id"), duration_ms=(time.perf_counter() - t0) * 1000.0, details={"status": job.get("status"), "total_bytes": job.get("total_bytes")})
     return job
 
 
@@ -349,6 +380,7 @@ async def list_mobile_jobs():
 @router.post("/cancel/{job_id}")
 async def cancel_mobile_job(job_id: str):
     """Signals cancellation to an active/queued mobile job and updates status safely."""
+    diagnostic_logger.log_event("api_cancel_request", job_id=job_id)
     job = job_manager.get_job(job_id)
     if not job:
         raise HTTPException(status_code=404, detail="Job not found")
@@ -388,23 +420,29 @@ async def download_mobile_job(request: Request, job_id: str):
     - Reuses existing deliver_file_response() implementation.
     - Preserves X-Accel, Range handling, and completion accounting.
     """
+    t0 = time.perf_counter()
     job = job_manager.get_job(job_id)
     if not job:
+        diagnostic_logger.log_event("api_download_rejected", job_id=job_id, duration_ms=(time.perf_counter() - t0) * 1000.0, level="WARN", details={"reason": "job_not_found"})
         raise HTTPException(status_code=404, detail="Job not found")
 
     status = job.get("status")
     if status == "asset_expired":
+        diagnostic_logger.log_event("api_download_rejected", job_id=job_id, file_id=job.get("file_id"), duration_ms=(time.perf_counter() - t0) * 1000.0, level="WARN", details={"reason": "asset_expired"})
         raise HTTPException(status_code=404, detail="Asset expired on server.")
 
     if status in ("failed", "cancelled"):
+        diagnostic_logger.log_event("api_download_rejected", job_id=job_id, file_id=job.get("file_id"), duration_ms=(time.perf_counter() - t0) * 1000.0, level="WARN", details={"reason": f"job_in_{status}_state"})
         raise HTTPException(status_code=400, detail=f"Cannot download job in '{status}' state.")
 
     if status in ("queued", "extracting", "downloading", "processing"):
+        diagnostic_logger.log_event("api_download_rejected", job_id=job_id, file_id=job.get("file_id"), duration_ms=(time.perf_counter() - t0) * 1000.0, level="WARN", details={"reason": f"job_in_{status}_state"})
         raise HTTPException(status_code=409, detail="Job is not ready for download yet.")
 
     file_id = job.get("file_id")
     if not file_id:
         job_manager.expire_job_asset(job_id=job_id)
+        diagnostic_logger.log_event("api_download_rejected", job_id=job_id, duration_ms=(time.perf_counter() - t0) * 1000.0, level="WARN", details={"reason": "no_file_id"})
         raise HTTPException(status_code=404, detail="Asset not found for this job.")
 
     async with main.state_lock:
@@ -414,14 +452,16 @@ async def download_mobile_job(request: Request, job_id: str):
             if rec:
                 main.active_file_map.pop(file_id, None)
                 if rec.get("filepath"):
-                    main.cleanup_file(rec["filepath"])
+                    main.cleanup_file(rec["filepath"], trigger="download_lookup_missing_or_expired", job_id=job_id, file_id=file_id)
             job_manager.expire_job_asset(job_id=job_id, file_id=file_id)
+            diagnostic_logger.log_event("api_download_rejected", job_id=job_id, file_id=file_id, duration_ms=(time.perf_counter() - t0) * 1000.0, level="WARN", details={"reason": "asset_expired_or_missing_on_disk"})
             raise HTTPException(status_code=404, detail="Asset expired, invalid, or already downloaded.")
 
     job_manager.update_job(job_id, status="delivering")
 
     delivery_mode = "nginx" if main.USE_X_ACCEL_REDIRECT else "python"
     diagnostic_timing.tracker.record_download_request(job_id, delivery_mode=delivery_mode)
+    diagnostic_logger.log_event("api_download_accepted", job_id=job_id, file_id=file_id, duration_ms=(time.perf_counter() - t0) * 1000.0, details={"delivery_mode": delivery_mode})
 
     title = job.get("title") or "StreamVault_Download"
     return await main.deliver_file_response(request, file_id, title, job_id=job_id)
