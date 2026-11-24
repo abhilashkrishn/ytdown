@@ -27,12 +27,13 @@
             <label for="resolutionSelect">Select Dynamic Target Profile</label>
             <select id="resolutionSelect"></select>
         </div>
-        
+
         <div class="button-group">
             <button id="downloadBtn" onclick="startDownload()">Download to Browser</button>
+            <button id="retryBtn" onclick="retryDownload()" class="btn-warning" style="display: none;">Refresh Cookies &amp; Retry</button>
             <button id="cancelBtn" onclick="cancelDownload()" class="btn-danger" style="display: none;">Cancel</button>
         </div>
-        
+
         <div id="progressContainer" class="progress-container" style="display: none;">
             <div class="progress-bar-wrapper">
                 <div id="progressBar" class="progress-bar-fill" role="progressbar" aria-valuenow="0" aria-valuemin="0" aria-valuemax="100"></div>

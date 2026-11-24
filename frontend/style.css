@@ -102,7 +102,7 @@ select {
     background-repeat: no-repeat;
     background-position: right 16px top 50%;
     background-size: 12px auto;
-    padding-right: 40px; 
+    padding-right: 40px;
 }
 
 input[type="text"]:focus, select:focus {
@@ -223,4 +223,10 @@ button:disabled {
 }
 .btn-danger:hover {
     background-color: #b91c1c; /* Slightly darker red */
+}
+.btn-warning {
+    background-color: #d97706;
+}
+.btn-warning:hover {
+    background-color: #b45309;
 }

@@ -90,12 +90,17 @@ class JobManager:
                     title TEXT,
                     file_id TEXT,
                     error_message TEXT,
+                    error_code TEXT,
                     created_at REAL NOT NULL,
                     updated_at REAL NOT NULL,
                     completed_at REAL
                 );
                 """
             )
+            cursor = conn.execute("PRAGMA table_info(mobile_jobs);")
+            columns = [row["name"] for row in cursor.fetchall()]
+            if "error_code" not in columns:
+                conn.execute("ALTER TABLE mobile_jobs ADD COLUMN error_code TEXT;")
             conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_mobile_jobs_status ON mobile_jobs(status);"
             )
@@ -109,6 +114,7 @@ class JobManager:
         url: str,
         title: Optional[str] = None,
         status: str = "queued",
+        error_code: Optional[str] = None,
     ) -> Dict[str, Any]:
         """Creates a new job in the database and initializes live tracking."""
         if not job_id or not isinstance(job_id, str):
@@ -126,10 +132,10 @@ class JobManager:
                 """
                 INSERT INTO mobile_jobs (
                     job_id, url, status, progress, downloaded_bytes, total_bytes,
-                    speed, eta, title, file_id, error_message, created_at, updated_at, completed_at
-                ) VALUES (?, ?, ?, 0.0, 0, 0, NULL, NULL, ?, NULL, NULL, ?, ?, ?);
+                    speed, eta, title, file_id, error_message, error_code, created_at, updated_at, completed_at
+                ) VALUES (?, ?, ?, 0.0, 0, 0, NULL, NULL, ?, NULL, NULL, ?, ?, ?, ?);
                 """,
-                (job_id, url, status, title, now, now, completed_at),
+                (job_id, url, status, title, error_code, now, now, completed_at),
             )
 
         with self._lock:
@@ -225,6 +231,7 @@ class JobManager:
         title: Optional[str] = None,
         file_id: Optional[str] = None,
         error_message: Optional[str] = None,
+        error_code: Optional[str] = None,
         progress: Optional[float] = None,
         downloaded_bytes: Optional[int] = None,
         total_bytes: Optional[int] = None,
@@ -272,6 +279,9 @@ class JobManager:
         if error_message is not None:
             updates.append("error_message = ?")
             params.append(error_message)
+        if error_code is not None:
+            updates.append("error_code = ?")
+            params.append(error_code)
         if progress is not None:
             updates.append("progress = ?")
             params.append(progress)
@@ -645,8 +655,9 @@ def create_job(
     url: str,
     title: Optional[str] = None,
     status: str = "queued",
+    error_code: Optional[str] = None,
 ) -> Dict[str, Any]:
-    return get_job_manager().create_job(job_id, url, title=title, status=status)
+    return get_job_manager().create_job(job_id, url, title=title, status=status, error_code=error_code)
 
 
 def get_job(job_id: str) -> Optional[Dict[str, Any]]:
@@ -663,6 +674,7 @@ def update_job(
     title: Optional[str] = None,
     file_id: Optional[str] = None,
     error_message: Optional[str] = None,
+    error_code: Optional[str] = None,
     progress: Optional[float] = None,
     downloaded_bytes: Optional[int] = None,
     total_bytes: Optional[int] = None,
@@ -675,6 +687,7 @@ def update_job(
         title=title,
         file_id=file_id,
         error_message=error_message,
+        error_code=error_code,
         progress=progress,
         downloaded_bytes=downloaded_bytes,
         total_bytes=total_bytes,

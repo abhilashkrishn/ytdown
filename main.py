@@ -324,6 +324,13 @@ async def run_maintenance_tasks():
         for sid in expired_sessions:
             active_sessions.pop(sid, None)
 
+        expired_retry_tokens = [
+            tok for tok, tdata in web_cookie_retry_tokens.items()
+            if (now - tdata.get("created_at", 0)) >= 600
+        ]
+        for tok in expired_retry_tokens:
+            web_cookie_retry_tokens.pop(tok, None)
+
         for fid, rec in list(active_file_map.items()):
             active_streams = rec.get("active_streams", 0)
             pending_requests = len(rec.get("pending_requests", set()))
@@ -849,6 +856,166 @@ def is_fully_covered(delivered_ranges: list, total_size: int) -> bool:
         return delivered_ranges[0][0] == 0 and delivered_ranges[0][1] >= total_size
     return False
 
+
+def is_youtube_url(url: str) -> bool:
+    """Verifies that the provided URL belongs to YouTube."""
+    if not url or not isinstance(url, str):
+        return False
+    try:
+        parsed = urlparse(url.strip())
+        netloc = parsed.netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return netloc == "youtube.com" or netloc.endswith(".youtube.com") or netloc == "youtu.be"
+    except Exception:
+        return False
+
+
+def normalize_video_url(u: str) -> str:
+    """Canonicalizes video URL scheme, hostname, and path to reliably match jobs."""
+    if not u or not isinstance(u, str):
+        return ""
+    try:
+        parsed = urlparse(u.strip())
+        path = parsed.path.rstrip("/")
+        netloc = parsed.netloc.lower()
+        if netloc.startswith("www."):
+            netloc = netloc[4:]
+        return parsed._replace(scheme=parsed.scheme.lower(), netloc=netloc, path=path, fragment="").geturl()
+    except Exception:
+        return u.strip()
+
+
+YOUTUBE_COOKIE_INDICATORS = (
+    "sign in to confirm you're not a bot",
+    "sign in to confirm you’re not a bot",
+    "confirm you're not a bot",
+    "confirm you’re not a bot",
+    "confirm you're not a robot",
+    "confirm you’re not a robot",
+    "bot verification",
+    "bot detection",
+    "sign in to confirm your age",
+    "use --cookies",
+    "--cookies-from-browser",
+    "how-do-i-pass-cookies-to-yt-dlp",
+    "please pass cookies",
+)
+
+GENERIC_NON_COOKIE_INDICATORS = (
+    "private video",
+    "video unavailable",
+    "this video has been removed",
+    "this video is not available",
+    "content is not available",
+    "not available in your country",
+    "who has blocked it",
+    "members-only",
+    "join this channel",
+)
+
+
+def classify_ytdlp_error(err_msg: str, url: str = "") -> typing.Optional[str]:
+    """
+    Centralized YouTube cookie/authentication error classifier.
+    Verifies source URL belongs to YouTube and recognizes actual yt-dlp bot-verification
+    and authentication error messages.
+    Excludes generic unavailable/private video messages and preserves non-cookie errors as None.
+    """
+    if not err_msg or not url or not is_youtube_url(url):
+        return None
+
+    msg = str(err_msg).lower()
+    if any(pat in msg for pat in GENERIC_NON_COOKIE_INDICATORS):
+        return None
+
+    if any(pat in msg for pat in YOUTUBE_COOKIE_INDICATORS):
+        return "cookie_required"
+
+    return None
+
+
+COOKIE_EXTRACT_SCRIPT = os.getenv("COOKIE_EXTRACT_SCRIPT", "/home/ubuntu/tests/youtube/extract.sh")
+cookie_refresh_lock = asyncio.Lock()
+_last_cookie_refresh_time = 0.0
+
+
+async def execute_cookie_refresh() -> tuple[bool, typing.Optional[str]]:
+    """
+    Executes the external YouTube cookie extraction script under a shared asyncio lock.
+    Prevents concurrent executions between simultaneous Web and Android retries.
+    Debounces rapid sequential executions if successful within the last 30 seconds.
+    Captures exit code and diagnostic output safely without logging credentials or cookies.
+    """
+    global _last_cookie_refresh_time
+    async with cookie_refresh_lock:
+        now = time.time()
+        if (now - _last_cookie_refresh_time) < 30.0:
+            return True, None
+
+        if not os.path.exists(COOKIE_EXTRACT_SCRIPT):
+            err_msg = f"Cookie extraction script not found at {COOKIE_EXTRACT_SCRIPT}"
+            if diagnostic_logger.is_enabled():
+                diagnostic_logger.log_event("cookie_refresh_failed", level="ERROR", details={"error": err_msg})
+            return False, err_msg
+
+        try:
+            if os.name == "nt":
+                import shutil
+                if COOKIE_EXTRACT_SCRIPT.endswith(".sh") and shutil.which("bash"):
+                    cmd = [shutil.which("bash"), COOKIE_EXTRACT_SCRIPT]
+                elif COOKIE_EXTRACT_SCRIPT.endswith(".py"):
+                    cmd = [sys.executable, COOKIE_EXTRACT_SCRIPT]
+                else:
+                    cmd = [COOKIE_EXTRACT_SCRIPT]
+            else:
+                if os.access(COOKIE_EXTRACT_SCRIPT, os.X_OK):
+                    cmd = [COOKIE_EXTRACT_SCRIPT]
+                else:
+                    cmd = ["/bin/bash", COOKIE_EXTRACT_SCRIPT]
+
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            stdout_bytes, stderr_bytes = await proc.communicate()
+
+            if proc.returncode != 0:
+                raw_err = stderr_bytes.decode(errors="replace").strip() or stdout_bytes.decode(errors="replace").strip()
+                clean_err = clean_terminal_ansi(raw_err)[:300]
+                fail_msg = f"Cookie extraction script failed (exit code {proc.returncode}): {clean_err}"
+                if diagnostic_logger.is_enabled():
+                    diagnostic_logger.log_event("cookie_refresh_failed", level="ERROR", details={"returncode": proc.returncode, "error": clean_err})
+                return False, fail_msg
+
+            _last_cookie_refresh_time = time.time()
+            if diagnostic_logger.is_enabled():
+                diagnostic_logger.log_event("cookie_refresh_success", details={"script": COOKIE_EXTRACT_SCRIPT})
+            return True, None
+        except Exception as exc:
+            clean_exc = clean_terminal_ansi(str(exc))
+            fail_msg = f"Failed to execute cookie extraction script: {clean_exc}"
+            if diagnostic_logger.is_enabled():
+                diagnostic_logger.log_event("cookie_refresh_exception", level="ERROR", details={"error": clean_exc})
+            return False, fail_msg
+
+
+# Session-bound explicit retry tokens for Web cookie failures:
+# Maps retry_token -> {"session_id": session_id, "url": normalized_url, "created_at": timestamp}
+web_cookie_retry_tokens: typing.Dict[str, typing.Dict[str, typing.Any]] = {}
+
+
+def get_request_session_id(request: Request) -> typing.Optional[str]:
+    """Extracts session_id from validated streamvault_session cookie."""
+    token = request.cookies.get("streamvault_session")
+    if not token:
+        return None
+    parts = token.split(":")
+    if len(parts) == 4:
+        return parts[1]
+    return None
+
 ### --- SECTION 8: NGINX PROTOCOL & APPLICATION LIFESPAN --- ###
 ### --- 8.1: NGINX LOG DATAGRAM LISTENER --- ###
 class NginxLogDatagramProtocol(asyncio.DatagramProtocol):
@@ -1175,6 +1342,7 @@ async def lifespan(app: FastAPI):
         active_download_tasks.clear()
         pending_disconnect_cleanups.clear()
         format_cache.clear()
+        web_cookie_retry_tokens.clear()
 
     # 2. Reset SQLite mobile jobs database and in-memory mobile API state
     try:
@@ -1452,7 +1620,18 @@ async def get_options(url: str):
             }
         return result
     except Exception as e:
-        print(f"Metadata extraction error for {url}: {clean_terminal_ansi(str(e))}")
+        err_text = clean_terminal_ansi(str(e))
+        print(f"Metadata extraction error for {url}: {err_text}")
+        error_code = classify_ytdlp_error(err_text, url)
+        if error_code:
+            return JSONResponse(
+                status_code=400,
+                content={
+                    "detail": err_text,
+                    "error": err_text,
+                    "error_code": error_code
+                }
+            )
         raise HTTPException(status_code=400, detail="Failed to retrieve video metadata. Please verify the URL and try again.")
     finally:
         extraction_semaphore.release()
@@ -1605,22 +1784,23 @@ async def execute_download_core(
                     file_id=file_uuid,
                     details={"resolved_title": captured_meta.get('title')}
                 )
-            return "DONE", None
+            return "DONE", None, None
         except DownloadCancelled:
             subproc_tracker.terminate_all()
-            return "CANCELLED", None
+            return "CANCELLED", None, None
         except Exception as e:
             subproc_tracker.terminate_all()
             err_text = clean_terminal_ansi(str(e))
+            error_code = classify_ytdlp_error(err_text, url)
             print(f"Download processing error for {url}: {err_text}")
             if diagnostic_logger.is_enabled():
                 diagnostic_logger.log_event(
                     "download_core_exception",
                     job_id=job_id,
                     file_id=file_uuid,
-                    details={"error": err_text, "traceback": traceback.format_exc()}
+                    details={"error": err_text, "error_code": error_code, "traceback": traceback.format_exc()}
                 )
-            return "ERROR", f"Failed to retrieve video metadata or download stream: {err_text}"
+            return "ERROR", f"Failed to retrieve video metadata or download stream: {err_text}", error_code
         finally:
             subproc_tracker.terminate_all()
             _thread_local.subprocess_tracker = None
@@ -1634,13 +1814,13 @@ async def execute_download_core(
 
     try:
         try:
-            outcome, err_msg = await asyncio.wait_for(asyncio.shield(worker_task), timeout=MAX_EXECUTION_TIME)
+            outcome, err_msg, error_code = await asyncio.wait_for(asyncio.shield(worker_task), timeout=MAX_EXECUTION_TIME)
         except asyncio.TimeoutError:
             cancel_event.set()
-            outcome, err_msg = "ERROR", "Download execution time limit exceeded."
+            outcome, err_msg, error_code = "ERROR", "Download execution time limit exceeded.", None
         except asyncio.CancelledError:
             cancel_event.set()
-            outcome, err_msg = "CANCELLED", "Download Cancelled."
+            outcome, err_msg, error_code = "CANCELLED", "Download Cancelled.", None
             raise
 
         ### --- 11.3: STORAGE TIERING & POST-DOWNLOAD COMPLETION --- ###
@@ -1769,9 +1949,12 @@ async def execute_download_core(
                     "download_core_outcome",
                     job_id=job_id,
                     file_id=file_uuid,
-                    details={"outcome": "FAILED", "error": err_msg}
+                    details={"outcome": "FAILED", "error": err_msg, "error_code": error_code}
                 )
-            return {"status": "failed", "error": err_msg or "Download failed due to an internal error. Please try again."}
+            fail_dict = {"status": "failed", "error": err_msg or "Download failed due to an internal error. Please try again."}
+            if error_code:
+                fail_dict["error_code"] = error_code
+            return fail_dict
 
     finally:
         worker_finished = False
@@ -1837,7 +2020,7 @@ async def execute_download_core(
 
 ### --- SECTION 12: DOWNLOAD PROGRESS ROUTE (SSE ADAPTER) --- ###
 @app.get("/api/download-progress", dependencies=[Depends(verify_session)])
-async def download_progress(request: Request, url: str, format_id: str):
+async def download_progress(request: Request, url: str, format_id: str, retry_token: typing.Optional[str] = None):
     try:
         await validate_url_safety(url)
         now = time.time()
@@ -1848,8 +2031,31 @@ async def download_progress(request: Request, url: str, format_id: str):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    session_id = get_request_session_id(request)
+    is_cookie_retry = False
+    if retry_token:
+        async with state_lock:
+            token_rec = web_cookie_retry_tokens.pop(retry_token, None)
+            now_ts = time.time()
+            if (
+                not token_rec
+                or not session_id
+                or token_rec.get("session_id") != session_id
+                or token_rec.get("url") != normalize_video_url(url)
+                or (now_ts - token_rec.get("created_at", 0)) >= 600
+            ):
+                raise HTTPException(status_code=400, detail="Invalid, expired, or unauthorized retry token.")
+            is_cookie_retry = True
+
     async def sse_event_generator():
         cancel_event = threading.Event()
+        if is_cookie_retry:
+            yield f"data: {json.dumps({'status': 'processing', 'percent': 0, 'speed': 'Refreshing YouTube session...', 'total_size': '', 'eta': ''})}\n\n"
+            refresh_ok, refresh_err = await execute_cookie_refresh()
+            if not refresh_ok:
+                yield f"data: {json.dumps({'status': 'failed', 'error': f'Cookie refresh failed: {refresh_err}', 'error_code': 'cookie_refresh_failed'})}\n\n"
+                return
+
         async with state_lock:
             if len(active_downloads) >= MAX_CONCURRENT_DOWNLOADS:
                 yield f"data: {json.dumps({'status': 'failed', 'error': 'Server at maximum download capacity. Try again later.'})}\n\n"
@@ -1925,7 +2131,22 @@ async def download_progress(request: Request, url: str, format_id: str):
                 elif res.get("status") == "cancelled":
                     yield f"data: {json.dumps({'status': 'failed', 'error': 'Download Cancelled.'})}\n\n"
                 elif res.get("status") == "failed":
-                    yield f"data: {json.dumps({'status': 'failed', 'error': res.get('error', 'Download failed due to an internal error. Please try again.')})}\n\n"
+                    fail_payload = {
+                        "status": "failed",
+                        "error": res.get("error", "Download failed due to an internal error. Please try again.")
+                    }
+                    if res.get("error_code"):
+                        fail_payload["error_code"] = res["error_code"]
+                        if res["error_code"] == "cookie_required" and session_id:
+                            token_val = f"rt_{uuid.uuid4().hex}"
+                            async with state_lock:
+                                web_cookie_retry_tokens[token_val] = {
+                                    "session_id": session_id,
+                                    "url": normalize_video_url(url),
+                                    "created_at": time.time()
+                                }
+                            fail_payload["retry_token"] = token_val
+                    yield f"data: {json.dumps(fail_payload)}\n\n"
 
         finally:
             if await request.is_disconnected():

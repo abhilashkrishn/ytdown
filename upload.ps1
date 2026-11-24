@@ -33,6 +33,15 @@ function Clean-FileWhitespace {
         $newline = "`n"
     }
 
+    # Remove trailing spaces and tabs from every line before EOF cleanup.
+    # Multiline mode preserves the existing line-ending characters.
+    $content = [regex]::Replace(
+        $content,
+        "[ `t]+(?=`r?$)",
+        "",
+        [System.Text.RegularExpressions.RegexOptions]::Multiline
+    )
+
     # Split into lines
     $lines = [regex]::Split($content, "\r\n|\n|\r")
 
@@ -51,9 +60,9 @@ function Clean-FileWhitespace {
         $cleaned = ($lines[0..$last] -join $newline) + $newline
     }
 
-    if ($cleaned -cne $content) {
+    if ($cleaned -cne [System.IO.File]::ReadAllText($fullPath, $encoding)) {
         [System.IO.File]::WriteAllText($fullPath, $cleaned, $encoding)
-        Write-Host "Cleaned EOF: $FilePath" -ForegroundColor Green
+        Write-Host "Cleaned whitespace/EOF: $FilePath" -ForegroundColor Green
     }
 }
 

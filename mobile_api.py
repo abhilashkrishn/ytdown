@@ -62,6 +62,7 @@ _mobile_lock = asyncio.Lock()
 
 class SubmitRequest(BaseModel):
     url: str
+    retry_job_id: Optional[str] = None
 
 
 def reset_in_memory_state() -> None:
@@ -256,12 +257,14 @@ async def _execute_mobile_job(
             diagnostic_logger.log_event("job_cancelled", job_id=job_id, file_id=file_uuid)
         else:
             err_msg = result.get("error", "Download failed.")
+            error_code = result.get("error_code")
             job_manager.update_job(
                 job_id=job_id,
                 status="failed",
-                error_message=err_msg
+                error_message=err_msg,
+                error_code=error_code
             )
-            diagnostic_logger.log_event("job_failed", job_id=job_id, file_id=file_uuid, level="ERROR", error=err_msg)
+            diagnostic_logger.log_event("job_failed", job_id=job_id, file_id=file_uuid, level="ERROR", error=err_msg, details={"error_code": error_code})
 
     except asyncio.CancelledError:
         cancel_event.set()
@@ -298,6 +301,23 @@ async def submit_job(payload: SubmitRequest):
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
 
+    # Validate explicit retry when retry_job_id is provided
+    if payload.retry_job_id:
+        prior_job = job_manager.get_job(payload.retry_job_id)
+        if not prior_job:
+            raise HTTPException(status_code=404, detail="Retry target job not found.")
+
+        prior_url = prior_job.get("url") or ""
+        if main.normalize_video_url(url) != main.normalize_video_url(prior_url):
+            raise HTTPException(status_code=400, detail="Retry URL does not match target job URL.")
+
+        if prior_job.get("status") != "failed" or prior_job.get("error_code") != "cookie_required":
+            raise HTTPException(status_code=400, detail="Target job is not in a failed 'cookie_required' state.")
+
+        refresh_ok, refresh_err = await main.execute_cookie_refresh()
+        if not refresh_ok:
+            raise HTTPException(status_code=502, detail=f"Cookie refresh failed: {refresh_err}")
+
     active_count = job_manager.get_active_job_count()
     if active_count >= MAX_MOBILE_QUEUED_ACTIVE:
         raise HTTPException(
@@ -310,7 +330,7 @@ async def submit_job(payload: SubmitRequest):
     diagnostic_timing.tracker.record_submission_received(job_id, url)
     job = job_manager.create_job(job_id=job_id, url=url, status="queued")
     diagnostic_timing.tracker.record_queued(job_id)
-    diagnostic_logger.log_event("job_queued", job_id=job_id, details={"status": "queued", "active_count": active_count + 1})
+    diagnostic_logger.log_event("job_queued", job_id=job_id, details={"status": "queued", "active_count": active_count + 1, "is_retry": bool(payload.retry_job_id)})
 
     schedule_mobile_queue()
 

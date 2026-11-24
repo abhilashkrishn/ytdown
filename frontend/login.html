@@ -20,12 +20,12 @@
             <label for="username">Username</label>
             <input type="text" id="username" name="username" autocomplete="username" autocapitalize="none" spellcheck="false" required>
         </div>
-        
+
         <div class="input-group">
             <label for="password">Password</label>
             <input type="password" id="password" name="password" autocomplete="current-password" style="width: 100%; padding: 14px 16px; font-size: 14px; background-color: var(--surface); color: var(--text-main); border: 1px solid var(--border); border-radius: 10px; box-sizing: border-box; transition: var(--transition);" required>
         </div>
-        
+
         <button type="submit" id="loginBtn">Access Vault</button>
         <div id="loginError" class="login-error">Invalid credentials</div>
     </form>
@@ -37,7 +37,7 @@ async function handleLogin(e) {
     const form = document.getElementById('loginForm');
     const btn = document.getElementById('loginBtn');
     const errorDiv = document.getElementById('loginError');
-    
+
     btn.disabled = true;
     errorDiv.style.display = 'none';
 
